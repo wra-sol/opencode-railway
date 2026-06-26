@@ -1,0 +1,6 @@
+# Local testing artifacts
+*.env
+.setup.env
+data/
+__pycache__/
+*.pyc
