@@ -5,3 +5,7 @@ data/
 __pycache__/
 *.pyc
 password.txt
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/

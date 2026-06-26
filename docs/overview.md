@@ -1,10 +1,10 @@
 # Deploy and Host OpenCode Wizard on Railway
 
-The OpenCode Wizard is a first-run web UI that configures a persistent opencode AI coding server on Railway. It validates your LLM provider API key live against the provider's API, populates available models, optionally clones a GitHub repo, and auto-generates a basic-auth password — turning a zero-variable deploy into a working AI pair-programmer in a single page.
+The OpenCode Wizard is a first-run web UI that configures a persistent opencode AI coding server on Railway. It has you set a login password, validates your LLM provider API key live against the provider's API, and optionally clones a GitHub repo — turning a zero-variable deploy into a working AI pair-programmer in a single page.
 
 ## About Hosting OpenCode Wizard
 
-Hosting the OpenCode Wizard means running [opencode](https://opencode.ai) as a long-lived server inside a Railway container. The Dockerfile installs opencode on Debian bookworm-slim; `entrypoint.sh` boots the wizard when no provider key is detected, then switches to `opencode web` once configuration is saved. State — chat sessions, auth tokens, the cloned repo, and `.setup.env` — lives on a Railway persistent volume mounted at `/data`, so everything survives redeploys and laptop shutdowns. You reconnect from a browser (HTTP basic auth, user `opencode`) or `opencode attach` from the terminal. Railway handles public networking, the `$PORT`, and restart policy.
+Hosting the OpenCode Wizard means running [opencode](https://opencode.ai) as a long-lived server inside a Railway container. The Dockerfile installs opencode on Debian bookworm-slim; `entrypoint.sh` boots the wizard when no server password is set, then switches to `opencode web` once configuration is saved. State — chat sessions, auth tokens, the cloned repo, and `.setup.env` — lives on a Railway persistent volume mounted at `/data`, so everything survives redeploys and laptop shutdowns. You reconnect from a browser (HTTP basic auth, user `opencode`) or `opencode attach` from the terminal. Railway handles public networking, the `$PORT`, and restart policy.
 
 ## Common Use Cases
 
@@ -22,27 +22,43 @@ Hosting the OpenCode Wizard means running [opencode](https://opencode.ai) as a l
 ### Deployment Dependencies
 
 - opencode installer: https://opencode.ai/install
-- An LLM provider API key from one of: Anthropic, OpenAI, OpenRouter, OpenCode Zen, DeepSeek, Groq, xAI, Together, Fireworks, Cerebras, Moonshot, Mistral, or NVIDIA — or any OpenAI-compatible endpoint via the "custom" provider option.
+- An LLM provider API key from any provider listed on [models.dev](https://models.dev) — Anthropic, OpenAI, OpenRouter, OpenCode Zen, DeepSeek, Groq, xAI, and many more — or any OpenAI-compatible endpoint via the "custom" provider option. The full catalog is sourced from models.dev at runtime.
 - A GitHub Personal Access Token (optional — `repo` scope, for cloning private repos and pushing changes back).
 - opencode docs: https://opencode.ai
 
 ### Implementation Details
 
-The container's behavior is decided at boot by `entrypoint.sh`:
+At boot, `entrypoint.sh` runs `prep.sh` (load `/data/.setup.env`, git identity,
+`generate_config.py`, seed skills + a global `AGENTS.md`, clone/pull `GIT_REPO`)
+then execs `wizard.py --manage` — a persistent manager that owns `$PORT`:
 
 ```sh
-# No provider key in env → wizard.py on $PORT (first-run setup UI)
-# Provider key present     → write opencode.json, clone/pull GIT_REPO, exec opencode web
+# entrypoint.sh → prep.sh (config/skills/repo) → exec wizard.py --manage
+#   manager: not configured? serve /setup (first-run form, no auth)
+#            configured?     spawn `opencode web` on 127.0.0.1:(PORT+1),
+#                            serve /manage (dashboard/logs/restart), and
+#                            reverse-proxy everything else to the child
+#                            (injecting opencode's basic auth behind a session)
 ```
 
-`provider_key_set()` checks for any of 13+ provider env vars. The wizard (`wizard.py`) validates keys live against each provider's `/models` endpoint, populates a searchable model list, validates GitHub PATs against the GitHub API, and persists everything to `/data/.setup.env` (chmod 600) before exiting non-zero so Railway restarts into `opencode web`.
+First-run setup is gated on `OPENCODE_SERVER_PASSWORD` being unset — it's the one
+thing the user must set so they know how to log in. The manager collects the
+provider key (validated live against each provider's `/models` endpoint),
+validates GitHub PATs against the GitHub API, and persists everything to
+`/data/.setup.env` (chmod 600). On save it re-runs `prep.sh` and (re)starts the
+`opencode web` child without a container restart. Reconfiguring later is an
+in-browser action at `/setup` (login required) — no env vars or restarts.
 
 ```text
 /data
-├── .setup.env                # wizard output (shell-sourceable, chmod 600)
-├── opencode.json             # model + share/autoupdate settings
-├── repo/                     # cloned project the agent works on
-└── .local/share/opencode/    # sessions, auth, snapshots (opencode's $HOME)
+├── .setup.env                     # wizard output (shell-sourceable, chmod 600, secrets here)
+├── opencode.json                  # model + mcp block (written by generate_config.py)
+├── repo/                          # cloned project the agent works on
+├── .config/opencode/
+│   ├── skills/                    # seeded agent skills (opt-in)
+│   ├── AGENTS.md                  # always-in-context environment briefing
+│   └── .AGENTS.md.bundled.sha256  # hash sidecar — lets bundled AGENTS.md updates reach existing deploys safely
+└── .local/share/opencode/         # sessions, auth, snapshots (opencode's $HOME)
 ```
 
 `HOME=/data` is set in the Dockerfile so opencode's session/auth state lives on the persistent volume.

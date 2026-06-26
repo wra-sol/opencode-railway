@@ -1,0 +1,13 @@
+target-version = "py310"
+line-length = 140
+
+[lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = [
+  "E501",   # line length handled by formatter; wizard has long inline HTML/JS strings
+  "E701",   # multiple statements on one line (compact helpers)
+  "E731",   # lambda assignments (used for filters)
+]
+
+[lint.per-file-ignores]
+"wizard.py" = ["E402", "F841", "F541", "I001"]
