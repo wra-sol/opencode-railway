@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
 set -e
 
 DATA_DIR="${DATA_DIR:-/data}"

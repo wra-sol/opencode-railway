@@ -1,0 +1,14 @@
+# Build context exclusions — keep image lean and avoid leaking local secrets.
+.git/
+.github/
+.gitignore
+__pycache__/
+*.pyc
+*.env
+.setup.env
+data/
+password.txt
+docs/
+LICENSE
+README.md
+TEMPLATE_VARIABLES.md

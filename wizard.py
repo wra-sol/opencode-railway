@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """First-run setup wizard for the opencode Railway template.
 
 Served on $PORT by entrypoint.sh when no provider API key is configured.

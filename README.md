@@ -13,11 +13,15 @@ your browser or terminal at any time.
 - **Secured by default** — HTTP basic auth on the public URL; password is
   auto-generated if you don't set one.
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/opencode-wizard)
+
 > ### 💡 Just click Deploy — no variables required
 > Every Railway template variable is **optional**. If you leave them all blank,
 > the first-run **setup wizard** launches on your Railway domain and walks you
 > through picking a provider, pasting a key, and (optionally) pointing at a repo.
 > Set variables up front only if you want to skip the wizard.
+
+**One-click template:** <https://railway.com/deploy/opencode-wizard>
 
 ---
 
@@ -35,18 +39,16 @@ your browser or terminal at any time.
    - If you didn't set variables, the **setup wizard** appears. Fill it in once.
    - If you did, log in as `opencode` with your `OPENCODE_SERVER_PASSWORD`.
 
-### Option B — Publish as a one-click Railway template
+### Option B — One-click Railway template
 
-Templates must come from a **public** repo. Once this repo is public:
+This repo is published as a Railway template. No variables are required — the
+wizard handles everything on first run.
 
-1. Go to <https://railway.com/button>.
-2. Point it at your repo. **You do not need to add any template variables** —
-   leave the variables list empty (or add only `OPENCODE_SERVER_PASSWORD` with
-   value `${{secret(24)}}` if you want to pre-fill it). When the user deploys
-   with nothing set, the setup wizard handles the rest. See
-   [`TEMPLATE_VARIABLES.md`](./TEMPLATE_VARIABLES.md) for the full maintainer
-   reference.
-3. Save → you get a **Deploy on Railway** button URL you can share.
+**Deploy:** <https://railway.com/deploy/opencode-wizard>
+
+Maintainer notes for the template composer (which variables to expose, what to
+pre-fill, what **not** to add) live in
+[`TEMPLATE_VARIABLES.md`](./TEMPLATE_VARIABLES.md).
 
 > The volume at `/data` still needs to be added after deploy (Railway templates
 > don't auto-create volumes). The setup wizard's success page reminds users of this.
@@ -142,4 +144,8 @@ Railway deploy
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE).
+
+Built on [opencode](https://opencode.ai) by [Anomaly](https://anoma.ly).
+opencode is © its respective contributors; this repo ships a deployment wrapper
+and first-run wizard and is licensed independently under MIT.
