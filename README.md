@@ -13,6 +13,12 @@ your browser or terminal at any time.
 - **Secured by default** — HTTP basic auth on the public URL; password is
   auto-generated if you don't set one.
 
+> ### 💡 Just click Deploy — no variables required
+> Every Railway template variable is **optional**. If you leave them all blank,
+> the first-run **setup wizard** launches on your Railway domain and walks you
+> through picking a provider, pasting a key, and (optionally) pointing at a repo.
+> Set variables up front only if you want to skip the wizard.
+
 ---
 
 ## Deploy
@@ -34,23 +40,43 @@ your browser or terminal at any time.
 Templates must come from a **public** repo. Once this repo is public:
 
 1. Go to <https://railway.com/button>.
-2. Point it at your repo and add these template variables (with descriptions):
-
-   | Variable | Required | Description |
-   |---|---|---|
-   | `OPENCODE_SERVER_PASSWORD` | no | Basic-auth password for the public URL. Auto-generated if blank. |
-   | `GIT_REPO` | no | Repo URL opencode works on inside the container, e.g. `https://github.com/you/repo`. |
-   | `GITHUB_TOKEN` | no | GitHub Classic PAT (`repo` scope) to clone private repos / push. |
-   | `OPENCODE_MODEL` | no | Model id like `anthropic/claude-sonnet-4-5`. Blank = opencode default. |
-   | `ANTHROPIC_API_KEY` | no | Set directly to skip the wizard and use Anthropic. |
-   | `OPENAI_API_KEY` | no | Set directly to skip the wizard and use OpenAI. |
-   | `OPENROUTER_API_KEY` | no | Set directly to skip the wizard and use OpenRouter. |
-   | `OPENCODE_API_KEY` | no | Set directly to skip the wizard and use OpenCode Zen. |
-
+2. Point it at your repo. **You do not need to add any template variables** —
+   leave the variables list empty (or add only `OPENCODE_SERVER_PASSWORD` with
+   value `${{secret(24)}}` if you want to pre-fill it). When the user deploys
+   with nothing set, the setup wizard handles the rest. See
+   [`TEMPLATE_VARIABLES.md`](./TEMPLATE_VARIABLES.md) for the full maintainer
+   reference.
 3. Save → you get a **Deploy on Railway** button URL you can share.
 
 > The volume at `/data` still needs to be added after deploy (Railway templates
 > don't auto-create volumes). The setup wizard's success page reminds users of this.
+
+---
+
+## First-run setup wizard
+
+When the container boots with no provider API key in the environment,
+`wizard.py` serves a one-page web UI on the Railway domain. Three sections,
+all optional except the provider + key:
+
+| Step | Field | Required | Notes |
+|---|---|---|---|
+| 1 · Provider | LLM provider | yes | Anthropic, OpenAI, OpenRouter, OpenCode Zen, DeepSeek, Groq, xAI, Together, Fireworks, Cerebras, Moonshot, Mistral, NVIDIA, or custom OpenAI-compatible. |
+| 1 · Provider | API key | yes | Stored to `/data/.setup.env` (chmod 600). |
+| 1 · Provider | Model id | no | Blank = opencode default for the chosen provider. |
+| 2 · Repo | Repo URL | no | Cloned into `/data/repo`. Set later if you like. |
+| 2 · Repo | GitHub PAT | no | Classic PAT with `repo` scope for private repos / pushing. |
+| 3 · Server | Password | no | Blank = auto-generated. |
+| 3 · Server | Git author name | no | Defaults to `opencode`. |
+
+![Setup wizard — provider step](docs/wizard-provider.png)
+![Setup wizard — repo step](docs/wizard-repo.png)
+![Setup wizard — success page](docs/wizard-success.png)
+
+> Screenshots are placeholders — drop real PNGs into `docs/` with these names.
+
+On submit, settings persist to `/data/.setup.env`, the service restarts, and
+`opencode web` comes up behind basic auth (`opencode` / your password).
 
 ---
 
