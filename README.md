@@ -155,8 +155,9 @@ MCP config is written to `/data/opencode.json` by `generate_config.py` on every
 boot, using `{env:VAR}` substitution so API keys stay in the environment, not in
 the JSON file. MCPs whose required key is missing are silently skipped.
 
-To add an MCP after setup, either reconfigure (below) or edit `opencode.json`
-directly — opencode merges project config with the custom config file.
+To add an MCP after setup, use `/setup` to reconfigure, or view the rendered
+config at `/manage/config`. Note: `opencode.json` is regenerated on every boot
+and every reconfigure, so manual edits will be overwritten.
 
 ---
 
@@ -190,9 +191,23 @@ file, re-runs `prep.sh`, and restarts the `opencode web` child to pick up the
 new settings. No Railway variable changes and no container restart needed. Your
 volume data (sessions, repo, auth) is preserved.
 
-A dashboard is also available at `/manage` (status, recent logs, and a restart
-button). The `RECONFIGURE` env var from earlier template versions is no longer
+A dashboard is also available at `/manage` (status, telemetry, recent logs,
+restart, key revalidate/rotate, audit log, session management, and backup/
+restore). The `RECONFIGURE` env var from earlier template versions is no longer
 needed — reconfiguring is now an in-browser action.
+
+### Config viewer
+
+`/manage/config` shows the rendered `opencode.json` (with `{env:VAR}`
+placeholders — no raw API keys) and a masked view of `.setup.env`. Use this
+to verify what's actually applied without SSH access.
+
+### Backup & restore
+
+`/manage/backup` downloads a tarball of your config files (`.setup.env`,
+`opencode.json`, `users.json`, `sessions.jsonl`, `audit.jsonl`). Restore
+via `POST /manage/restore` with a tarball upload — the manager validates
+the structure, replaces the files, and triggers a restart.
 
 ---
 
