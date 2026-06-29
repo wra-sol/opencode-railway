@@ -300,6 +300,47 @@ def test_setup_with_cookie_renders_reconfigure_form(configured_manager):
     assert st == 200
 
 
+def test_unauth_setup_redirect_encodes_next(configured_manager):
+    st, hdr, _ = _req("GET", configured_manager, "/setup", raw=True)
+    assert st == 302
+    assert hdr["Location"] == "/manage/login?next=%2Fsetup"
+
+
+def test_login_with_next_setup_lands_on_form(configured_manager):
+    cookie = _login(configured_manager, "testpw", nxt="/setup")
+    st, body = _req("GET", configured_manager, "/setup", headers={"Cookie": cookie})
+    assert st == 200
+    assert 'action="/setup"' in body
+    assert "LLM Provider" in body
+
+
+def test_login_wrong_password_preserves_next_setup(configured_manager):
+    st, body = _req("POST", configured_manager, "/manage/login", body="password=wrong&next=/setup")
+    assert st == 200
+    assert "Incorrect password" in body
+    assert 'name="next" value="/setup"' in body
+
+
+def test_authenticated_login_redirects_to_next(configured_manager):
+    cookie = _login(configured_manager, "testpw")
+    st, hdr, _ = _req("GET", configured_manager, "/manage/login?next=/setup", headers={"Cookie": cookie}, raw=True)
+    assert st == 302
+    assert hdr["Location"] == "/setup"
+
+
+def test_unauth_post_setup_redirects_to_login(configured_manager):
+    st, hdr, _ = _req("POST", configured_manager, "/setup", body="provider=anthropic&apikey=x", raw=True)
+    assert st == 302
+    assert hdr["Location"] == "/manage/login?next=%2Fsetup"
+
+
+def test_setup_trailing_slash_serves_form(configured_manager):
+    cookie = _login(configured_manager, "testpw")
+    st, body = _req("GET", configured_manager, "/setup/", headers={"Cookie": cookie})
+    assert st == 200
+    assert "LLM Provider" in body
+
+
 # ─── first-run save flow (auto-login + child start) ─────────────────────────────
 
 

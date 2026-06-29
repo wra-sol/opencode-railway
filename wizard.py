@@ -39,7 +39,7 @@ import urllib.error
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 # ─── Constants ─────────────────────────────────────────────────────────────────
 
@@ -536,6 +536,38 @@ def verify_session_cookie(secret, value):
         return False
     expected = hmac.new(secret, f"{exp}".encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, expected)
+
+
+def _safe_next(value, default="/manage"):
+    """Restrict post-login redirects to same-origin relative paths."""
+    if not value or not value.startswith("/") or value.startswith("//"):
+        return default
+    return value
+
+
+def _login_url(next_path):
+    return "/manage/login?next=" + quote(_safe_next(next_path), safe="")
+
+
+def _request_path(handler):
+    path = urlparse(handler.path).path
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/") or "/"
+    return path
+
+
+def _cookie_attrs(handler):
+    attrs = f"Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}"
+    proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    if proto == "https":
+        attrs += "; Secure"
+    return attrs
+
+
+def _session_cookie_header(handler, value, *, clear=False):
+    if clear:
+        return f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+    return f"{SESSION_COOKIE}={value}; {_cookie_attrs(handler)}"
 
 
 class ChildProcess:
@@ -1315,7 +1347,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj), "application/json")
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        path = _request_path(self)
         if path in ("/global/health", "/health"):
             # Healthy when: unconfigured (wizard up), child fully up, or child
             # still booting (proc alive). Only unhealthy if the child has crashed
@@ -1325,6 +1357,9 @@ class Handler(BaseHTTPRequestHandler):
             healthy = (not self.manager.configured) or child.is_up() or child.is_starting()
             return self._json(200, {"healthy": bool(healthy)})
         if path == "/manage/login":
+            if self.manager.configured and self._authenticated():
+                nxt = _safe_next(parse_qs(urlparse(self.path).query).get("next", ["/manage"])[0])
+                return self._redirect(nxt)
             return self._render_login()
         if path == "/manage/logout":
             return self._clear_session("/manage/login")
@@ -1332,7 +1367,7 @@ class Handler(BaseHTTPRequestHandler):
         # everything (the opencode UI, reconfigure, management, SSE). The manager
         # injects opencode's basic auth behind the scenes so the user logs in once.
         if self.manager.configured and not self._authenticated():
-            return self._redirect("/manage/login?next=" + path)
+            return self._redirect(_login_url(path))
         if path == "/setup":
             return self._render_form()
         if path == "/manage" or path.startswith("/manage/"):
@@ -1495,7 +1530,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, page)
 
     def do_POST(self):
-        path = self.path.split("?")[0]
+        path = _request_path(self)
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length > MAX_BODY:
             return self._send(413, "body too large", "text/plain")
@@ -1517,6 +1552,8 @@ class Handler(BaseHTTPRequestHandler):
         # and health (handled in do_GET). This blocks a public domain from driving
         # setup/test/management/proxy endpoints without a session.
         if self.manager.configured and not self._authenticated():
+            if path == "/setup":
+                return self._redirect(_login_url("/setup"))
             return self._json(401, {"ok": False, "error": "unauthenticated"})
         if path.startswith("/manage/"):
             return self._manage_post(path, f, f_multi, raw)
@@ -1705,7 +1742,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header(
             "Set-Cookie",
-            f"{SESSION_COOKIE}={val}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}",
+            _session_cookie_header(self, val),
         )
         self.send_header("Connection", "close")
         self.end_headers()
@@ -1755,10 +1792,7 @@ class Handler(BaseHTTPRequestHandler):
     def _clear_session(self, to):
         self.send_response(302)
         self.send_header("Location", to)
-        self.send_header(
-            "Set-Cookie",
-            f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
-        )
+        self.send_header("Set-Cookie", _session_cookie_header(self, "", clear=True))
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
         self.end_headers()
@@ -1775,25 +1809,28 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", nxt)
             self.send_header(
                 "Set-Cookie",
-                f"{SESSION_COOKIE}={val}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}",
+                _session_cookie_header(self, val),
             )
             self.send_header("Content-Length", "0")
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
             return
-        return self._render_login(error="Incorrect password.")
+        return self._render_login(error="Incorrect password.", next_path=nxt)
 
-    def _render_login(self, error=""):
+    def _render_login(self, error="", next_path=None):
         err = f'<div class="alert err">{html.escape(error)}</div>' if error else ""
-        nxt = html.escape(parse_qs(urlparse(self.path).query).get("next", ["/manage"])[0])
+        if next_path is None:
+            nxt = _safe_next(parse_qs(urlparse(self.path).query).get("next", ["/manage"])[0])
+        else:
+            nxt = _safe_next(next_path)
         page = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>{CSS}</style></head><body><div class="wrap">
 <div class="brand"><div class="brand-mark"></div><div class="brand-name">opencode</div></div>
 <p class="sub">Railway manager &middot; login</p>
 {err}
 <form method="POST" action="/manage/login" class="section">
-<input type="hidden" name="next" value="{nxt}">
+<input type="hidden" name="next" value="{html.escape(nxt)}">
 <label>Password</label>
 <input type="password" name="password" autofocus required>
 <button type="submit" class="btn-submit">Log in</button>
