@@ -1023,3 +1023,246 @@ def test_metrics_counts_login_failures(configured_manager):
     st, body = _req("GET", configured_manager, "/manage/metrics", headers={"Cookie": cookie})
     after = int(re.search(r"opencode_railway_login_failures_total (\d+)", body).group(1))
     assert after > initial
+
+
+# ─── Wave 3.1: Merge-based .setup.env writes ───────────────────────────────────
+
+
+def test_reconfigure_preserves_unmanaged_keys(tmp_path, fake_bin):
+    """Reconfiguring should preserve env vars not managed by the form."""
+    port = _free_port()
+    data = tmp_path / "data"
+    data.mkdir()
+    # Use custom provider to avoid needing models.dev fetch in tests
+    (data / ".setup.env").write_text(
+        "OPENCODE_SERVER_PASSWORD=testpw\n"
+        "CUSTOM_API_KEY=fakekey\n"
+        "OPENCODE_PROVIDER=custom\n"
+        "OPENCODE_PROVIDER_KEY_ENV=CUSTOM_API_KEY\n"
+        "OPENCODE_CUSTOM_ID=custom\n"
+        "OPENCODE_CUSTOM_LABEL=Custom\n"
+        "OPENCODE_CUSTOM_BASEURL=https://gw.example.com/v1\n"
+        "OPENCODE_CUSTOM_NPM=@ai-sdk/openai-compatible\n"
+        "OPENCODE_CUSTOM_ENV=CUSTOM_API_KEY\n"
+        "OPENCODE_MODEL=custom/m1\n"
+        "CUSTOM_VAR=should_survive\n"
+    )
+    os.chmod(data / ".setup.env", 0o600)
+    proc = _start_manager(port, str(data), fake_bin)
+    try:
+        assert _wait_ready(port)
+        cookie = _login(port, "testpw")
+        st, hdr, body = _req("GET", port, "/setup", headers={"Cookie": cookie}, raw=True)
+        import re
+
+        m = re.search(r'name="csrf_token" value="([^"]+)"', body.decode("utf-8", "replace"))
+        csrf = m.group(1) if m else ""
+        form = (
+            f"provider=custom&envvar=CUSTOM_API_KEY&baseurl=https://gw.example.com/v1"
+            f"&apikey=&model=m1&gitname=oc&gitemail=oc@x&csrf_token={csrf}"
+        )
+        st, _ = _req("POST", port, "/setup", body=form, headers={"Cookie": cookie})
+        assert st == 200
+        env = (data / ".setup.env").read_text()
+        assert "CUSTOM_VAR=should_survive" in env
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_reconfigure_mcp_key_preserved_when_rechecked(tmp_path, fake_bin):
+    """If an MCP is re-checked and the key field is blank, the existing key is preserved."""
+    port = _free_port()
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / ".setup.env").write_text(
+        "OPENCODE_SERVER_PASSWORD=testpw\n"
+        "CUSTOM_API_KEY=fakekey\n"
+        "OPENCODE_PROVIDER=custom\n"
+        "OPENCODE_PROVIDER_KEY_ENV=CUSTOM_API_KEY\n"
+        "OPENCODE_CUSTOM_ID=custom\n"
+        "OPENCODE_CUSTOM_LABEL=Custom\n"
+        "OPENCODE_CUSTOM_BASEURL=https://gw.example.com/v1\n"
+        "OPENCODE_CUSTOM_NPM=@ai-sdk/openai-compatible\n"
+        "OPENCODE_CUSTOM_ENV=CUSTOM_API_KEY\n"
+        "OPENCODE_MODEL=custom/m1\n"
+        "ENABLED_MCPS=tavily\n"
+        "TAVILY_API_KEY=tavilykey123\n"
+    )
+    os.chmod(data / ".setup.env", 0o600)
+    proc = _start_manager(port, str(data), fake_bin)
+    try:
+        assert _wait_ready(port)
+        cookie = _login(port, "testpw")
+        st, hdr, body = _req("GET", port, "/setup", headers={"Cookie": cookie}, raw=True)
+        import re
+
+        m = re.search(r'name="csrf_token" value="([^"]+)"', body.decode("utf-8", "replace"))
+        csrf = m.group(1) if m else ""
+        form = (
+            f"provider=custom&envvar=CUSTOM_API_KEY&baseurl=https://gw.example.com/v1"
+            f"&apikey=&model=m1&mcp=tavily&gitname=oc&gitemail=oc@x&csrf_token={csrf}"
+        )
+        st, _ = _req("POST", port, "/setup", body=form, headers={"Cookie": cookie})
+        assert st == 200
+        env = (data / ".setup.env").read_text()
+        assert "TAVILY_API_KEY=tavilykey123" in env
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+# ─── Wave 3.2: No surprise password regen ──────────────────────────────────────
+
+
+def test_reconfigure_blank_password_keeps_current(tmp_path, fake_bin):
+    """Reconfiguring with no password change should keep the current password."""
+    port = _free_port()
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / ".setup.env").write_text(
+        "OPENCODE_SERVER_PASSWORD=testpw\n"
+        "CUSTOM_API_KEY=fakekey\n"
+        "OPENCODE_PROVIDER=custom\n"
+        "OPENCODE_PROVIDER_KEY_ENV=CUSTOM_API_KEY\n"
+        "OPENCODE_CUSTOM_ID=custom\n"
+        "OPENCODE_CUSTOM_LABEL=Custom\n"
+        "OPENCODE_CUSTOM_BASEURL=https://gw.example.com/v1\n"
+        "OPENCODE_CUSTOM_NPM=@ai-sdk/openai-compatible\n"
+        "OPENCODE_CUSTOM_ENV=CUSTOM_API_KEY\n"
+        "OPENCODE_MODEL=custom/m1\n"
+    )
+    os.chmod(data / ".setup.env", 0o600)
+    proc = _start_manager(port, str(data), fake_bin)
+    try:
+        assert _wait_ready(port)
+        cookie = _login(port, "testpw")
+        st, hdr, body = _req("GET", port, "/setup", headers={"Cookie": cookie}, raw=True)
+        import re
+
+        m = re.search(r'name="csrf_token" value="([^"]+)"', body.decode("utf-8", "replace"))
+        csrf = m.group(1) if m else ""
+        form = (
+            f"provider=custom&envvar=CUSTOM_API_KEY&baseurl=https://gw.example.com/v1"
+            f"&apikey=&model=m1&gitname=oc&gitemail=oc@x&csrf_token={csrf}"
+        )
+        st, body = _req("POST", port, "/setup", body=form, headers={"Cookie": cookie})
+        assert st == 200
+        env = (data / ".setup.env").read_text()
+        assert "OPENCODE_SERVER_PASSWORD=testpw" in env
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_reconfigure_change_password_updates(tmp_path, fake_bin):
+    """Explicitly changing the password should update it."""
+    port = _free_port()
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / ".setup.env").write_text(
+        "OPENCODE_SERVER_PASSWORD=testpw\n"
+        "CUSTOM_API_KEY=fakekey\n"
+        "OPENCODE_PROVIDER=custom\n"
+        "OPENCODE_PROVIDER_KEY_ENV=CUSTOM_API_KEY\n"
+        "OPENCODE_CUSTOM_ID=custom\n"
+        "OPENCODE_CUSTOM_LABEL=Custom\n"
+        "OPENCODE_CUSTOM_BASEURL=https://gw.example.com/v1\n"
+        "OPENCODE_CUSTOM_NPM=@ai-sdk/openai-compatible\n"
+        "OPENCODE_CUSTOM_ENV=CUSTOM_API_KEY\n"
+        "OPENCODE_MODEL=custom/m1\n"
+    )
+    os.chmod(data / ".setup.env", 0o600)
+    proc = _start_manager(port, str(data), fake_bin)
+    try:
+        assert _wait_ready(port)
+        cookie = _login(port, "testpw")
+        st, hdr, body = _req("GET", port, "/setup", headers={"Cookie": cookie}, raw=True)
+        import re
+
+        m = re.search(r'name="csrf_token" value="([^"]+)"', body.decode("utf-8", "replace"))
+        csrf = m.group(1) if m else ""
+        form = (
+            f"provider=custom&envvar=CUSTOM_API_KEY&baseurl=https://gw.example.com/v1"
+            f"&apikey=&model=m1&change_password=newpw123&gitname=oc&gitemail=oc@x&csrf_token={csrf}"
+        )
+        st, body = _req("POST", port, "/setup", body=form, headers={"Cookie": cookie})
+        assert st == 200
+        env = (data / ".setup.env").read_text()
+        assert "OPENCODE_SERVER_PASSWORD=newpw123" in env
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_first_run_blank_password_auto_generates(tmp_path, fake_bin):
+    """First-run with blank password should auto-generate one."""
+    port = _free_port()
+    data = tmp_path / "data"
+    data.mkdir()
+    proc = _start_manager(port, str(data), fake_bin)
+    try:
+        assert _wait_ready(port)
+        st, hdr, body = _req("GET", port, "/", raw=True)
+        import re
+
+        m = re.search(r'name="csrf_token" value="([^"]+)"', body.decode("utf-8", "replace"))
+        csrf = m.group(1) if m else ""
+        csrf_cookie = ""
+        ch = hdr.get("Set-Cookie", "")
+        if "oc_csrf=" in ch:
+            csrf_cookie = ch.split("oc_csrf=")[1].split(";")[0]
+        # First-run with blank password
+        form = (
+            "provider=custom&envvar=CUSTOM_API_KEY&baseurl=https://gw.example.com/v1"
+            "&apikey=fakekey&model=m1&gitname=oc&gitemail=oc@x&csrf_token=" + csrf
+        )
+        st, hdr, body = _req(
+            "POST",
+            port,
+            "/setup",
+            body=form,
+            headers={"Cookie": f"oc_csrf={csrf_cookie}"} if csrf_cookie else {},
+            raw=True,
+        )
+        assert st == 200
+        env = (data / ".setup.env").read_text()
+        # Password should be auto-generated (not empty)
+        assert "OPENCODE_SERVER_PASSWORD=" in env
+        pw_line = [line for line in env.split("\n") if line.startswith("OPENCODE_SERVER_PASSWORD=")][0]
+        assert len(pw_line.split("=", 1)[1]) > 10  # auto-generated is ~24 chars
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+# ─── Wave 3.4: Graceful drain on restart ────────────────────────────────────────
+
+
+def test_proxy_503_has_retry_after(configured_manager):
+    """The 503 response during child downtime should have a Retry-After header."""
+    cookie = _login(configured_manager, "testpw")
+    csrf = _csrf_token("testpw")
+    # Restart the child — during the brief downtime, a request should get 503+Retry-After
+    _req("POST", configured_manager, "/manage/restart", headers={"Cookie": cookie}, body=f"csrf_token={csrf}", raw=True)
+    # Immediately try to proxy — might catch the draining window
+    st, hdr, _ = _req("GET", configured_manager, "/", headers={"Cookie": cookie}, raw=True)
+    # It might be 200 (child came back fast) or 503 (still restarting)
+    if st == 503:
+        assert "Retry-After" in hdr
+        assert hdr["Retry-After"] == "10"
