@@ -324,11 +324,11 @@ def test_rate_limited_allows_then_blocks(monkeypatch):
     t = [0.0]
     monkeypatch.setattr(wizard.time, "time", lambda: t[0])
     allowed = 0
-    for _ in range(wizard._RATE_MAX):
+    for _ in range(wizard._RATE_MAX_POST):
         t[0] += 0.001
         if not wizard._rate_limited("1.2.3.4"):
             allowed += 1
-    assert allowed == wizard._RATE_MAX
+    assert allowed == wizard._RATE_MAX_POST
     assert wizard._rate_limited("1.2.3.4") is True
     # different ip has its own budget
     assert wizard._rate_limited("5.6.7.8") is False
