@@ -90,7 +90,7 @@ HOP_BY_HOP = {
 HOP_BY_HOP_REQ = HOP_BY_HOP | {"host", "authorization", "content-length"}
 SESSION_COOKIE = "oc_session"
 SESSION_TTL = 7 * 24 * 3600
-LOG_RING = 400  # max lines kept for /manage/logs
+LOG_RING = 1000  # max entries kept for /manage/logs (+ SSE tail)
 CHILD_RESPAWN_MAX = 5
 
 # Curated "popular" providers shown first in the picker (display order).
@@ -812,6 +812,12 @@ class ChildProcess:
         self.stopping = False
         self.crashes = 0
         self._lock = threading.Lock()
+        # ── Runtime telemetry (Wave 2.1) ──
+        self.started_at = None  # time.time() of last successful spawn
+        self.last_exit_rc = None  # return code of the last exited process
+        self.last_exit_at = None  # time.time() of last exit
+        self.restart_history = deque(maxlen=10)  # {ts, reason, rc} entries
+        self._restart_reason = None  # set by restart() so _watch records the right reason
 
     @staticmethod
     def _free_port():
@@ -841,6 +847,8 @@ class ChildProcess:
             text=True,
             bufsize=1,
         )
+        self.started_at = time.time()
+        self.log_event("info", f"child spawned (pid={self.proc.pid}, port={self.internal_port})")
         print(
             f"[manager] opencode child started (pid={self.proc.pid}, port={self.internal_port})",
             flush=True,
@@ -853,6 +861,53 @@ class ChildProcess:
                 self.log_ring.append(line.rstrip("\n"))
         except Exception:
             pass
+
+    def log_event(self, level, message):
+        """Append a manager-level event to the log ring (Wave 2.2).
+
+        Entries are structured so the SSE tail and filter/search can distinguish
+        manager events from child stdout lines.
+        """
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "source": "manager",
+            "level": level,
+            "line": message,
+        }
+        self.log_ring.append(entry)
+
+    def uptime(self):
+        """Seconds since the current child started, or None if not running."""
+        if not self.started_at:
+            return None
+        return time.time() - self.started_at
+
+    def _record_exit(self, rc, reason):
+        """Record exit telemetry (rc, timestamp, restart history entry)."""
+        self.last_exit_rc = rc
+        self.last_exit_at = time.time()
+        self.restart_history.append(
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                "reason": reason,
+                "rc": rc,
+            }
+        )
+
+    def telemetry(self):
+        """Return a dict of runtime telemetry for /manage/status and /metrics."""
+        with self._lock:
+            proc = self.proc
+            pid = proc.pid if proc and proc.poll() is None else None
+        return {
+            "pid": pid,
+            "started_at": self.started_at,
+            "uptime_s": self.uptime(),
+            "last_exit_rc": self.last_exit_rc,
+            "last_exit_at": self.last_exit_at,
+            "crash_count": self.crashes,
+            "restarts": list(self.restart_history),
+        }
 
     def start(self):
         with self._lock:
@@ -869,14 +924,20 @@ class ChildProcess:
             rc = proc.wait()
             print(f"[manager] opencode child exited (rc={rc})", flush=True)
             if self.stopping:
+                reason = self._restart_reason or "stopped"
+                self._record_exit(rc, reason)
+                self._restart_reason = None
                 return
             with self._lock:
+                self._record_exit(rc, "crash")
                 if self.crashes >= CHILD_RESPAWN_MAX:
                     print("[manager] child crashed too many times; giving up", flush=True)
+                    self.log_event("error", f"child gave up after {self.crashes} crashes (last rc={rc})")
                     self.proc = None
                     return
                 self.crashes += 1
                 delay = min(2**self.crashes, 30)
+            self.log_event("warn", f"child crashed (rc={rc}), respawning in {delay}s (crash #{self.crashes})")
             print(f"[manager] respawning child in {delay}s (crash #{self.crashes})", flush=True)
             time.sleep(delay)
             with self._lock:
@@ -898,8 +959,10 @@ class ChildProcess:
             except Exception:
                 pass
 
-    def restart(self):
+    def restart(self, reason="manual"):
         self.crashes = 0
+        # Set the restart reason so _watch records it correctly instead of "stopped"
+        self._restart_reason = reason
         self.stop()
         self.stopping = False
         with self._lock:
@@ -934,6 +997,42 @@ class ChildProcess:
         return bool(proc) and proc.poll() is None and not self.is_up()
 
 
+class Metrics:
+    """In-process metrics counters for /metrics (Wave 2.3).
+
+    Single-replica, process-lifetime — resets on container restart.
+    Thread-safe via a single lock.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.request_counts = {}  # path-key → count
+        self.login_attempts = 0
+        self.login_failures = 0
+        self.restart_counts = {}  # reason → count
+        self.proxy_errors = 0
+
+    def record_request(self, path):
+        with self._lock:
+            self.request_counts[path] = self.request_counts.get(path, 0) + 1
+
+    def record_login_attempt(self):
+        with self._lock:
+            self.login_attempts += 1
+
+    def record_login_failure(self):
+        with self._lock:
+            self.login_failures += 1
+
+    def record_restart(self, reason):
+        with self._lock:
+            self.restart_counts[reason] = self.restart_counts.get(reason, 0) + 1
+
+    def record_proxy_error(self):
+        with self._lock:
+            self.proxy_errors += 1
+
+
 class Manager:
     """Server-level state shared across Handler instances (one per request)."""
 
@@ -943,6 +1042,11 @@ class Manager:
         self.log_ring = deque(maxlen=LOG_RING)
         self.child = ChildProcess(data_dir, port + 1, self.log_ring)
         self.settings = Settings(data_dir)
+        self.metrics = Metrics()
+
+    def log_event(self, level, message):
+        """Append a manager-level event to the log ring."""
+        self.child.log_event(level, message)
 
     @property
     def password(self):
@@ -961,8 +1065,9 @@ class Manager:
     def stop_child(self):
         self.child.stop()
 
-    def restart_child(self):
-        self.child.restart()
+    def restart_child(self, reason="manual"):
+        self.metrics.record_restart(reason)
+        self.child.restart(reason)
 
     def apply_settings(self):
         """After a /setup save: reload env, re-run prep, (re)start the child."""
@@ -971,7 +1076,8 @@ class Manager:
         with self.child._lock:
             running = self.child.proc and self.child.proc.poll() is None
         if running:
-            self.child.restart()
+            self.metrics.record_restart("reconfigure")
+            self.child.restart("reconfigure")
         else:
             self.child.start()
 
@@ -1587,6 +1693,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = _request_path(self)
+        self.manager.metrics.record_request(path)
         if path in ("/global/health", "/health"):
             # Healthy when: unconfigured (wizard up), child fully up, or child
             # still booting (proc alive). Only unhealthy if the child has crashed
@@ -1778,6 +1885,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = _request_path(self)
+        self.manager.metrics.record_request(path)
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length > MAX_BODY:
             return self._send(413, "body too large", "text/plain")
@@ -1990,6 +2098,7 @@ class Handler(BaseHTTPRequestHandler):
         # in the background re-runs prep (opencode.json, skills, AGENTS.md, repo)
         # and (re)starts the opencode child without blocking the response.
         reload_env_from_setup(self.data_dir)
+        self.manager.log_event("info", "setup saved — applying settings + restarting child")
         print("[manager] setup saved — applying settings", flush=True)
         threading.Thread(target=self.manager.apply_settings, daemon=True).start()
         # Auto-login: issue a session cookie for the new password so the success
@@ -2125,8 +2234,10 @@ class Handler(BaseHTTPRequestHandler):
         pw = f.get("password", "")
         nxt = f.get("next", "/manage") or "/manage"
         ip = _client_ip(self)
+        self.manager.metrics.record_login_attempt()
         if pw and hmac.compare_digest(pw, self.manager.password):
             _record_login_success(ip)
+            self.manager.log_event("info", f"login success from {ip}")
             val = make_session_cookie(self.manager.session_secret())
             self.send_response(302)
             self.send_header("Location", nxt)
@@ -2142,6 +2253,8 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         _record_login_failure(ip)
+        self.manager.metrics.record_login_failure()
+        self.manager.log_event("warn", f"login failure from {ip}")
         return self._render_login(error="Incorrect password.", next_path=nxt)
 
     def _render_login(self, error="", next_path=None):
@@ -2231,6 +2344,8 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
             self.close_connection = True
         except Exception as e:
+            self.manager.metrics.record_proxy_error()
+            self.manager.log_event("error", f"proxy error: {e}")
             try:
                 self._send(502, f"proxy error: {e}", "text/plain")
             except Exception:
@@ -2259,9 +2374,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/manage":
             return self._render_dashboard()
         if path == "/manage/logs":
-            return self._json(200, {"lines": list(self.manager.log_ring)})
+            level, source, q = self._log_filter_params()
+            return self._json(200, {"lines": self._filtered_logs(level, source, q)})
+        if path == "/manage/logs/stream":
+            return self._log_sse_stream()
         if path == "/manage/status":
             prev = load_existing(self.data_dir)
+            telemetry = self.manager.child.telemetry()
             return self._json(
                 200,
                 {
@@ -2273,12 +2392,169 @@ class Handler(BaseHTTPRequestHandler):
                     "enabled_mcps": prev.get("ENABLED_MCPS", ""),
                     "enabled_skills": prev.get("ENABLED_SKILLS", ""),
                     "volume_mounted": volume_mounted(self.data_dir),
+                    # Wave 2.1 — runtime telemetry
+                    "pid": telemetry["pid"],
+                    "started_at": telemetry["started_at"],
+                    "uptime_s": telemetry["uptime_s"],
+                    "last_exit_rc": telemetry["last_exit_rc"],
+                    "last_exit_at": telemetry["last_exit_at"],
+                    "crash_count": telemetry["crash_count"],
+                    "restarts": telemetry["restarts"],
                 },
             )
+        if path == "/manage/metrics":
+            return self._metrics()
         return self._send(404, "not found", "text/plain")
+
+    # ── log filtering + SSE tail (Wave 2.2) ────────────────────────────────────
+
+    @staticmethod
+    def _log_entry_text(entry):
+        """Normalize a log ring entry to a display string."""
+        if isinstance(entry, dict):
+            return entry.get("line", "")
+        return str(entry)
+
+    @staticmethod
+    def _log_entry_source(entry):
+        if isinstance(entry, dict):
+            return entry.get("source", "manager")
+        return "child"
+
+    @staticmethod
+    def _log_entry_level(entry):
+        if isinstance(entry, dict):
+            return entry.get("level", "info")
+        return "info"
+
+    def _log_filter_params(self):
+        """Extract ?level=, ?source=, ?q= from the query string."""
+        q = parse_qs(urlparse(self.path).query)
+        level = q.get("level", [None])[0]
+        source = q.get("source", [None])[0]
+        search = q.get("q", [None])[0]
+        return level, source, search
+
+    def _filtered_logs(self, level=None, source=None, q=None):
+        """Return log ring entries matching the filter params, normalized to dicts."""
+        out = []
+        for entry in list(self.manager.log_ring):
+            ent_source = self._log_entry_source(entry)
+            ent_level = self._log_entry_level(entry)
+            ent_text = self._log_entry_text(entry)
+            if source and ent_source != source:
+                continue
+            if level and ent_level != level:
+                continue
+            if q and q.lower() not in ent_text.lower():
+                continue
+            if isinstance(entry, dict):
+                out.append(entry)
+            else:
+                # Normalize child stdout (plain string) to a dict for the API
+                out.append({"ts": "", "source": "child", "level": "info", "line": ent_text})
+        return out
+
+    def _log_sse_stream(self):
+        """SSE stream that tails the log ring live (Wave 2.2).
+
+        Sends the current ring contents as an initial burst (filtered), then
+        appends new entries as they arrive. Uses a simple poll-with-backoff
+        approach since the log ring is a deque (no push notification).
+        """
+        level, source, q = self._log_filter_params()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        for k, v in _security_headers(self, is_proxy=True).items():
+            self.send_header(k, v)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            # Initial burst: send current filtered ring
+            sent_count = 0
+            for entry in self._filtered_logs(level, source, q):
+                data = json.dumps(entry)
+                self.wfile.write(f"data: {data}\n\n".encode())
+                sent_count += 1
+            self.wfile.flush()
+            # Tail: poll for new entries
+            ring_len = len(self.manager.log_ring)
+            while True:
+                time.sleep(0.5)
+                current = len(self.manager.log_ring)
+                if current <= ring_len:
+                    # Ring may have rotated (maxlen) — just update our cursor
+                    ring_len = current
+                    continue
+                # Send new entries (from ring_len to current)
+                entries = list(self.manager.log_ring)[ring_len:]
+                ring_len = current
+                for entry in entries:
+                    ent_source = self._log_entry_source(entry)
+                    ent_level = self._log_entry_level(entry)
+                    ent_text = self._log_entry_text(entry)
+                    if source and ent_source != source:
+                        continue
+                    if level and ent_level != level:
+                        continue
+                    if q and q.lower() not in ent_text.lower():
+                        continue
+                    if isinstance(entry, dict):
+                        data = json.dumps(entry)
+                    else:
+                        data = json.dumps({"ts": "", "source": "child", "level": "info", "line": ent_text})
+                    self.wfile.write(f"data: {data}\n\n".encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # ── /metrics Prometheus endpoint (Wave 2.3) ────────────────────────────────
+
+    def _metrics(self):
+        """Emit Prometheus text format metrics."""
+        mgr = self.manager
+        child = mgr.child
+        m = mgr.metrics
+        lines = []
+        # Counters
+        lines.append("# HELP opencode_railway_requests_total Total HTTP requests by path")
+        lines.append("# TYPE opencode_railway_requests_total counter")
+        for path_key, count in sorted(m.request_counts.items()):
+            lines.append(f'opencode_railway_requests_total{{path="{path_key}"}} {count}')
+        lines.append("# HELP opencode_railway_login_attempts_total Total login attempts")
+        lines.append("# TYPE opencode_railway_login_attempts_total counter")
+        lines.append(f"opencode_railway_login_attempts_total {m.login_attempts}")
+        lines.append("# HELP opencode_railway_login_failures_total Total failed logins")
+        lines.append("# TYPE opencode_railway_login_failures_total counter")
+        lines.append(f"opencode_railway_login_failures_total {m.login_failures}")
+        lines.append("# HELP opencode_railway_child_crashes_total Total child crashes")
+        lines.append("# TYPE opencode_railway_child_crashes_total counter")
+        lines.append(f"opencode_railway_child_crashes_total {child.crashes}")
+        lines.append("# HELP opencode_railway_restarts_total Total restarts by reason")
+        lines.append("# TYPE opencode_railway_restarts_total counter")
+        for reason, count in sorted(m.restart_counts.items()):
+            lines.append(f'opencode_railway_restarts_total{{reason="{reason}"}} {count}')
+        lines.append("# HELP opencode_railway_proxy_errors_total Total proxy errors")
+        lines.append("# TYPE opencode_railway_proxy_errors_total counter")
+        lines.append(f"opencode_railway_proxy_errors_total {m.proxy_errors}")
+        # Gauges
+        lines.append("# HELP opencode_railway_child_up 1 if child is up, 0 otherwise")
+        lines.append("# TYPE opencode_railway_child_up gauge")
+        lines.append(f"opencode_railway_child_up {1 if child.is_up() else 0}")
+        lines.append("# HELP opencode_railway_log_ring_size Current log ring size")
+        lines.append("# TYPE opencode_railway_log_ring_size gauge")
+        lines.append(f"opencode_railway_log_ring_size {len(mgr.log_ring)}")
+        lines.append("# HELP opencode_railway_uptime_seconds Child uptime in seconds")
+        lines.append("# TYPE opencode_railway_uptime_seconds gauge")
+        up = child.uptime() or 0
+        lines.append(f"opencode_railway_uptime_seconds {up:.1f}")
+        return self._send(200, "\n".join(lines) + "\n", "text/plain; version=0.0.4")
 
     def _manage_post(self, path, f, f_multi, raw):
         if path == "/manage/restart":
+            self.manager.log_event("info", "restart requested via /manage")
             print("[manager] restart requested via /manage", flush=True)
             threading.Thread(target=self.manager.restart_child, daemon=True).start()
             return self._redirect("/manage")
@@ -2298,6 +2574,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "error": "A valid env var name and key are required."})
             self.manager.settings.update({envvar: apikey})
             reload_env_from_setup(self.data_dir)
+            self.manager.log_event("info", f"key rotated for {envvar}; applying + restarting child")
             print(f"[manager] key rotated for {envvar}; applying + restarting child", flush=True)
             threading.Thread(target=self.manager.apply_settings, daemon=True).start()
             return self._redirect("/manage")
@@ -2311,8 +2588,25 @@ class Handler(BaseHTTPRequestHandler):
             pid = mgr.child.proc.pid if mgr.child.proc and mgr.child.proc.poll() is None else None
         csrf_token = self._csrf_token()
         csrf_input = f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">'
+        # Runtime telemetry (Wave 2.1)
+        telemetry = mgr.child.telemetry()
+        uptime_str = "—"
+        if telemetry["uptime_s"] is not None:
+            secs = int(telemetry["uptime_s"])
+            if secs >= 3600:
+                uptime_str = f"{secs // 3600}h {(secs % 3600) // 60}m"
+            elif secs >= 60:
+                uptime_str = f"{secs // 60}m {secs % 60}s"
+            else:
+                uptime_str = f"{secs}s"
+        last_exit = "—"
+        if telemetry["last_exit_rc"] is not None:
+            last_exit = f"rc={telemetry['last_exit_rc']}"
         rows = [
             ("opencode child", f"{'up' if up else 'down'}" + (f" (pid {pid})" if pid else "")),
+            ("Uptime", uptime_str),
+            ("Crashes", str(telemetry["crash_count"])),
+            ("Last exit", last_exit),
             ("Provider", prev.get("OPENCODE_PROVIDER", "—")),
             ("Model", prev.get("OPENCODE_MODEL", "opencode default")),
             ("Repo", prev.get("GIT_REPO", "—") or "—"),
@@ -2324,8 +2618,10 @@ class Handler(BaseHTTPRequestHandler):
             f'<div class="creds-row"><span class="k">{html.escape(k)}</span><span class="v">{html.escape(str(v))}</span></div>'
             for k, v in rows
         )
+        # Recent logs — normalize entries (child=string, manager=dict) for display
+        recent = list(mgr.log_ring)[-40:]
         logs_html = (
-            "\n".join(f'<div class="log-line">{html.escape(line)}</div>' for line in list(mgr.log_ring)[-40:])
+            "\n".join(f'<div class="log-line">{html.escape(e if isinstance(e, str) else e.get("line", ""))}</div>' for e in recent)
             or '<div class="log-line muted">no logs yet</div>'
         )
         key_info = self._resolve_provider_key(prev)

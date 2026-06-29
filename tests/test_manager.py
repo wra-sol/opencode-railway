@@ -863,3 +863,163 @@ def test_login_lockout_resets_on_success(configured_manager):
     for _ in range(3):
         st, _ = _req("POST", configured_manager, "/manage/login", body=f"password=wrong&csrf_token={csrf}", headers=headers)
         assert st == 200  # "Incorrect password" page, not 429
+
+
+# ─── Wave 2.1: Runtime telemetry ───────────────────────────────────────────────
+
+
+def test_status_includes_telemetry(configured_manager):
+    """/manage/status should include crash_count, uptime, last_exit_rc, restarts."""
+    cookie = _login(configured_manager, "testpw")
+    st, body = _req("GET", configured_manager, "/manage/status", headers={"Cookie": cookie})
+    assert st == 200
+    j = json.loads(body)
+    assert "crash_count" in j
+    assert "uptime_s" in j
+    assert "last_exit_rc" in j
+    assert "restarts" in j
+    assert "pid" in j
+    assert "started_at" in j
+    assert isinstance(j["restarts"], list)
+
+
+def test_telemetry_records_restart(configured_manager):
+    """A manual restart should appear in the restart history."""
+    cookie = _login(configured_manager, "testpw")
+    csrf = _csrf_token("testpw")
+    # Get initial restarts
+    st, body = _req("GET", configured_manager, "/manage/status", headers={"Cookie": cookie})
+    initial_restarts = json.loads(body)["restarts"]
+    initial_count = len(initial_restarts)
+    # Restart
+    _req("POST", configured_manager, "/manage/restart", headers={"Cookie": cookie}, body=f"csrf_token={csrf}", raw=True)
+    # Wait for child to come back
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        st, _ = _req("GET", configured_manager, "/", headers={"Cookie": cookie})
+        if st == 200:
+            break
+        time.sleep(0.3)
+    # Check restart history grew
+    st, body = _req("GET", configured_manager, "/manage/status", headers={"Cookie": cookie})
+    j = json.loads(body)
+    assert len(j["restarts"]) > initial_count
+    assert j["restarts"][-1]["reason"] == "manual"
+
+
+def test_dashboard_shows_telemetry(configured_manager):
+    """The dashboard should show uptime and crash count."""
+    cookie = _login(configured_manager, "testpw")
+    st, body = _req("GET", configured_manager, "/manage", headers={"Cookie": cookie})
+    assert st == 200
+    assert "Uptime" in body
+    assert "Crashes" in body
+
+
+# ─── Wave 2.2: SSE log tail + manager events + filter ──────────────────────────
+
+
+def test_manage_logs_returns_entries(configured_manager):
+    """/manage/logs should return structured entries with source/level fields."""
+    cookie = _login(configured_manager, "testpw")
+    st, body = _req("GET", configured_manager, "/manage/logs", headers={"Cookie": cookie})
+    assert st == 200
+    j = json.loads(body)
+    assert isinstance(j["lines"], list)
+
+
+def test_manage_logs_filter_by_source(configured_manager):
+    """?source=manager should return only manager events."""
+    cookie = _login(configured_manager, "testpw")
+    csrf = _csrf_token("testpw")
+    # Generate a manager event (restart)
+    _req("POST", configured_manager, "/manage/restart", headers={"Cookie": cookie}, body=f"csrf_token={csrf}", raw=True)
+    time.sleep(1)
+    # Filter for manager events
+    st, body = _req("GET", configured_manager, "/manage/logs?source=manager", headers={"Cookie": cookie})
+    assert st == 200
+    j = json.loads(body)
+    assert isinstance(j["lines"], list)
+    assert len(j["lines"]) > 0
+    for entry in j["lines"]:
+        assert entry["source"] == "manager"
+
+
+def test_manage_logs_search(configured_manager):
+    """?q=<text> should filter log entries by substring."""
+    cookie = _login(configured_manager, "testpw")
+    st, body = _req("GET", configured_manager, "/manage/logs?q=FAKE", headers={"Cookie": cookie})
+    assert st == 200
+    j = json.loads(body)
+    for entry in j["lines"]:
+        assert "FAKE" in entry.get("line", "").upper() or len(j["lines"]) == 0
+
+
+def test_manager_events_in_log_ring(configured_manager):
+    """A restart should produce a manager event in the log ring."""
+    cookie = _login(configured_manager, "testpw")
+    csrf = _csrf_token("testpw")
+    _req("POST", configured_manager, "/manage/restart", headers={"Cookie": cookie}, body=f"csrf_token={csrf}", raw=True)
+    time.sleep(1)
+    st, body = _req("GET", configured_manager, "/manage/logs?source=manager", headers={"Cookie": cookie})
+    j = json.loads(body)
+    texts = [e.get("line", "") for e in j["lines"]]
+    assert any("restart" in t.lower() for t in texts)
+
+
+# ─── Wave 2.3: /metrics Prometheus endpoint ────────────────────────────────────
+
+
+def test_metrics_requires_auth(configured_manager):
+    """/manage/metrics should require session auth."""
+    st, _ = _req("GET", configured_manager, "/manage/metrics")
+    assert st == 302  # redirect to login
+
+
+def test_metrics_returns_prometheus_text(configured_manager):
+    """/manage/metrics should return parseable Prometheus text format."""
+    cookie = _login(configured_manager, "testpw")
+    st, body = _req("GET", configured_manager, "/manage/metrics", headers={"Cookie": cookie})
+    assert st == 200
+    # Check for Prometheus format markers
+    assert "# HELP" in body
+    assert "# TYPE" in body
+    assert "opencode_railway_" in body
+    assert "opencode_railway_child_up" in body
+    assert "opencode_railway_uptime_seconds" in body
+
+
+def test_metrics_counts_requests(configured_manager):
+    """Making requests should increment the request counter in /metrics."""
+    cookie = _login(configured_manager, "testpw")
+    # Make a few requests
+    for _ in range(3):
+        _req("GET", configured_manager, "/manage/status", headers={"Cookie": cookie})
+    st, body = _req("GET", configured_manager, "/manage/metrics", headers={"Cookie": cookie})
+    assert st == 200
+    assert 'opencode_railway_requests_total{path="/manage/status"}' in body
+
+
+def test_metrics_counts_login_failures(configured_manager):
+    """Failed logins should increment the login_failures counter."""
+    import re
+
+    # Get CSRF nonce
+    st, hdr, body = _req("GET", configured_manager, "/manage/login", raw=True)
+    m = re.search(r'name="csrf_token" value="([^"]+)"', body.decode("utf-8", "replace"))
+    csrf = m.group(1) if m else ""
+    csrf_cookie = ""
+    ch = hdr.get("Set-Cookie", "")
+    if "oc_csrf=" in ch:
+        csrf_cookie = ch.split("oc_csrf=")[1].split(";")[0]
+    headers = {"Cookie": f"oc_csrf={csrf_cookie}"} if csrf_cookie else {}
+    # Get initial metrics
+    cookie = _login(configured_manager, "testpw")
+    st, body = _req("GET", configured_manager, "/manage/metrics", headers={"Cookie": cookie})
+    initial = int(re.search(r"opencode_railway_login_failures_total (\d+)", body).group(1))
+    # Failed login
+    _req("POST", configured_manager, "/manage/login", body=f"password=wrong&csrf_token={csrf}", headers=headers)
+    # Check counter incremented
+    st, body = _req("GET", configured_manager, "/manage/metrics", headers={"Cookie": cookie})
+    after = int(re.search(r"opencode_railway_login_failures_total (\d+)", body).group(1))
+    assert after > initial
