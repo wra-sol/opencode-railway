@@ -70,6 +70,16 @@ _LOCKOUT_THRESHOLD = 5  # failures before lockout kicks in
 _LOCKOUT_STEPS = [60, 300, 900]  # exponential: 1min, 5min, 15min
 _TRUSTED_XFF_HOPS = int(os.environ.get("TRUSTED_XFF_HOPS", "1"))
 
+# ─── Wave 4: Team features ─────────────────────────────────────────────────────
+# Optional per-user accounts, server-side session store, audit log, and
+# bootstrap token. All opt-in: if /data/users.json is absent, single-password
+# mode is fully preserved (solo-safe). BOOTSTRAP_TOKEN is optional.
+
+_BOOTSTRAP_TOKEN = os.environ.get("BOOTSTRAP_TOKEN", "")
+USERS_PATH = "users.json"
+SESSIONS_PATH = "sessions.jsonl"
+AUDIT_PATH = "audit.jsonl"
+
 # Valid POSIX shell identifier for custom provider key env var name.
 _ENV_VAR_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
@@ -763,6 +773,10 @@ _STATE_CHANGING_POSTS = frozenset(
         "/manage/restart",
         "/manage/revalidate",
         "/manage/keys/rotate",
+        "/manage/sessions/revoke",
+        "/manage/sessions/revoke-all",
+        "/manage/users/add",
+        "/manage/users/remove",
         "/setup",
         "/test-key",
         "/test-github",
@@ -1036,6 +1050,287 @@ class Metrics:
             self.proxy_errors += 1
 
 
+# ─── Wave 4.1: Per-user accounts ───────────────────────────────────────────────
+
+
+def _hash_password(password):
+    """Hash a password using PBKDF2-HMAC-SHA256 (stdlib, portable).
+
+    Returns a string in the format 'pbkdf2$<iterations>$<salt_hex>$<hash_hex>'
+    that can be verified by _verify_password.
+    """
+    salt = secrets.token_bytes(16)
+    iterations = 100000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"pbkdf2${iterations}${salt.hex()}${digest.hex()}"
+
+
+def _verify_password(password, stored):
+    """Verify a password against a stored hash from _hash_password."""
+    if not stored or not stored.startswith("pbkdf2$"):
+        return False
+    parts = stored.split("$")
+    if len(parts) != 4:
+        return False
+    try:
+        iterations = int(parts[1])
+        salt = bytes.fromhex(parts[2])
+        expected = bytes.fromhex(parts[3])
+    except (ValueError, TypeError):
+        return False
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return hmac.compare_digest(digest, expected)
+
+
+class UserStore:
+    """Manages /data/users.json for multi-user mode (Wave 4.1).
+
+    If users.json is absent, the server runs in single-password mode
+    (current behavior, fully preserved). If present, multi-user mode
+    activates with per-user bcrypt-equivalent hashes and roles.
+    """
+
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.path = os.path.join(data_dir, USERS_PATH)
+        self._lock = threading.Lock()
+
+    def exists(self):
+        return os.path.exists(self.path)
+
+    def load(self):
+        """Load users list. Returns [] if no users.json (single-password mode)."""
+        if not self.exists():
+            return []
+        try:
+            with open(self.path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def save(self, users):
+        with self._lock:
+            with open(self.path, "w") as f:
+                json.dump(users, f, indent=2)
+            os.chmod(self.path, 0o600)
+
+    def find(self, username):
+        for u in self.load():
+            if u.get("username") == username:
+                return u
+        return None
+
+    def verify(self, username, password):
+        """Returns (user_dict, True) if valid, (None, False) if not."""
+        u = self.find(username)
+        if not u:
+            return None, False
+        if _verify_password(password, u.get("hash", "")):
+            return u, True
+        return None, False
+
+    def add(self, username, password, role="user"):
+        """Add a user. Returns True on success, False if username exists."""
+        users = self.load()
+        if any(u["username"] == username for u in users):
+            return False
+        users.append({"username": username, "hash": _hash_password(password), "role": role})
+        self.save(users)
+        return True
+
+    def remove(self, username):
+        users = self.load()
+        new = [u for u in users if u["username"] != username]
+        if len(new) == len(users):
+            return False
+        self.save(new)
+        return True
+
+    def set_role(self, username, role):
+        users = self.load()
+        for u in users:
+            if u["username"] == username:
+                u["role"] = role
+                self.save(users)
+                return True
+        return False
+
+    def reset_password(self, username, new_password):
+        users = self.load()
+        for u in users:
+            if u["username"] == username:
+                u["hash"] = _hash_password(new_password)
+                self.save(users)
+                return True
+        return False
+
+
+# ─── Wave 4.2: Server-side session store + revocation ──────────────────────────
+
+
+class SessionStore:
+    """Manages /data/sessions.jsonl for server-side sessions (Wave 4.2).
+
+    In single-password mode, the existing stateless HMAC cookie is used
+    (backward compatible). In multi-user mode, opaque session IDs backed
+    by this store replace the stateless cookie.
+    """
+
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.path = os.path.join(data_dir, SESSIONS_PATH)
+        self._lock = threading.Lock()
+
+    def create(self, username, ip, ua):
+        """Create a new session, return the session ID."""
+        sid = secrets.token_urlsafe(32)
+        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        exp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + SESSION_TTL))
+        entry = {"sid": sid, "username": username, "ip": ip, "ua": ua, "login_at": now, "last_seen": now, "expires": exp}
+        with self._lock:
+            with open(self.path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        return sid
+
+    def _load_all(self):
+        if not os.path.exists(self.path):
+            return []
+        out = []
+        with open(self.path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        return out
+
+    def lookup(self, sid):
+        """Look up a session by SID. Returns the entry or None.
+        Updates last_seen. Returns None if revoked or expired."""
+        if not sid:
+            return None
+        for entry in self._load_all():
+            if entry.get("sid") == sid and not entry.get("revoked"):
+                # Check expiry
+                exp_str = entry.get("expires", "")
+                if exp_str:
+                    try:
+                        exp_time = time.mktime(time.strptime(exp_str, "%Y-%m-%dT%H:%M:%S"))
+                        if time.time() > exp_time:
+                            return None
+                    except (ValueError, TypeError):
+                        pass
+                # Update last_seen
+                entry["last_seen"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+                self._update_entry(entry)
+                return entry
+        return None
+
+    def _update_entry(self, updated):
+        """Replace an entry in the file (by sid)."""
+        with self._lock:
+            entries = self._load_all()
+            for i, e in enumerate(entries):
+                if e.get("sid") == updated.get("sid"):
+                    entries[i] = updated
+                    break
+            with open(self.path, "w") as f:
+                for e in entries:
+                    f.write(json.dumps(e) + "\n")
+
+    def revoke(self, sid):
+        """Revoke a session by SID."""
+        with self._lock:
+            entries = self._load_all()
+            for e in entries:
+                if e.get("sid") == sid:
+                    e["revoked"] = True
+                    e["revoked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+            with open(self.path, "w") as f:
+                for e in entries:
+                    f.write(json.dumps(e) + "\n")
+
+    def revoke_all_except(self, sid):
+        """Revoke all sessions except the given one."""
+        with self._lock:
+            entries = self._load_all()
+            now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+            for e in entries:
+                if e.get("sid") != sid and not e.get("revoked"):
+                    e["revoked"] = True
+                    e["revoked_at"] = now
+            with open(self.path, "w") as f:
+                for e in entries:
+                    f.write(json.dumps(e) + "\n")
+
+    def list_active(self):
+        """Return all active (non-revoked, non-expired) sessions."""
+        now = time.time()
+        out = []
+        for e in self._load_all():
+            if e.get("revoked"):
+                continue
+            exp_str = e.get("expires", "")
+            if exp_str:
+                try:
+                    exp_time = time.mktime(time.strptime(exp_str, "%Y-%m-%dT%H:%M:%S"))
+                    if now > exp_time:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            out.append(e)
+        return out
+
+
+# ─── Wave 4.3: Audit log ───────────────────────────────────────────────────────
+
+
+class AuditLog:
+    """Append-only audit log at /data/audit.jsonl (Wave 4.3)."""
+
+    def __init__(self, data_dir):
+        self.path = os.path.join(data_dir, AUDIT_PATH)
+        self._lock = threading.Lock()
+
+    def record(self, user, ip, action, detail=None):
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "user": user,
+            "ip": ip,
+            "action": action,
+            "detail": detail or {},
+        }
+        with self._lock:
+            with open(self.path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+
+    def read(self, page=1, limit=50, user_filter=None, action_filter=None):
+        """Read audit entries with pagination and filtering."""
+        if not os.path.exists(self.path):
+            return [], 0
+        entries = []
+        with open(self.path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        e = json.loads(line)
+                        if user_filter and e.get("user") != user_filter:
+                            continue
+                        if action_filter and e.get("action") != action_filter:
+                            continue
+                        entries.append(e)
+                    except json.JSONDecodeError:
+                        pass
+        entries.reverse()  # newest first
+        total = len(entries)
+        start = (page - 1) * limit
+        end = start + limit
+        return entries[start:end], total
+
+
 class Manager:
     """Server-level state shared across Handler instances (one per request)."""
 
@@ -1046,6 +1341,15 @@ class Manager:
         self.child = ChildProcess(data_dir, port + 1, self.log_ring)
         self.settings = Settings(data_dir)
         self.metrics = Metrics()
+        # Wave 4: team features
+        self.users = UserStore(data_dir)
+        self.sessions = SessionStore(data_dir)
+        self.audit = AuditLog(data_dir)
+
+    @property
+    def multi_user(self):
+        """True if /data/users.json exists (multi-user mode)."""
+        return self.users.exists()
 
     def log_event(self, level, message):
         """Append a manager-level event to the log ring."""
@@ -1257,6 +1561,8 @@ PAGE = """<!doctype html>
   <p class="sub">Railway server &middot; first-run configuration</p>
 
   __VOLUME_ALERT__
+
+  __BOOTSTRAP_TOKEN_FIELD__
 
   <form method="POST" action="/setup" id="form">
     __CSRF_INPUT__
@@ -1855,9 +2161,22 @@ class Handler(BaseHTTPRequestHandler):
             f"var __customMcps = {mcp_custom_json};\n__customMcps.forEach(function(c) {{ addCustomMcp(c.name, c.url, c.hn, c.hv); }});"
         )
 
+        # Wave 4.4: bootstrap token field (only on first-run if token is set)
+        bootstrap_field = ""
+        if _BOOTSTRAP_TOKEN and not self.manager.configured:
+            bootstrap_field = (
+                '<div class="alert warn">'
+                "<strong>Bootstrap token required.</strong> This server requires a "
+                "bootstrap token for first-run configuration. Enter it below.</div>"
+                '<div class="section"><div class="field">'
+                '<label for="bootstrap_token">Bootstrap token</label>'
+                '<input name="bootstrap_token" id="bootstrap_token" required class="mono">'
+                "</div></div>"
+            )
         page = (
             PAGE.replace("__CSS__", CSS)
             .replace("__VOLUME_ALERT__", volume_alert)
+            .replace("__BOOTSTRAP_TOKEN_FIELD__", bootstrap_field)
             .replace("__PROVIDER_OPTIONS__", provider_options)
             .replace("__PROVIDERS_JSON__", providers_js)
             .replace("__CURATED_JSON__", curated_js)
@@ -2011,6 +2330,11 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_setup(self, f, f_multi=None):
         if f_multi is None:
             f_multi = {}
+        # Wave 4.4: bootstrap token for first-run
+        if _BOOTSTRAP_TOKEN and not self.manager.configured:
+            token = (f.get("bootstrap_token") or "").strip()
+            if not hmac.compare_digest(token, _BOOTSTRAP_TOKEN):
+                return self._send(400, self._err_page("Invalid or missing bootstrap token."))
         providers = get_providers(self.data_dir)
         provider = f.get("provider", "anthropic")
         is_custom = provider == "custom"
@@ -2168,6 +2492,7 @@ class Handler(BaseHTTPRequestHandler):
         # and (re)starts the opencode child without blocking the response.
         reload_env_from_setup(self.data_dir)
         self.manager.log_event("info", "setup saved — applying settings + restarting child")
+        self.manager.audit.record(self._current_user() or "anonymous", _client_ip(self), "reconfigure")
         print("[manager] setup saved — applying settings", flush=True)
         threading.Thread(target=self.manager.apply_settings, daemon=True).start()
         # Auto-login: issue a session cookie for the new password so the success
@@ -2222,9 +2547,57 @@ class Handler(BaseHTTPRequestHandler):
                     c[k.strip()] = v.strip()
         return c
 
+    def _current_user(self):
+        """Return the username for the current session, or None.
+        In single-password mode, returns 'opencode' if authenticated.
+        In multi-user mode, returns the authenticated user's username.
+        """
+        if not self.manager.configured:
+            return "anonymous"
+        if self.manager.multi_user:
+            entry = self.manager.sessions.lookup(self._cookies().get(SESSION_COOKIE))
+            if entry:
+                return entry.get("username")
+            # Basic auth in multi-user mode
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Basic "):
+                try:
+                    decoded = base64.b64decode(auth[6:].strip()).decode("utf-8", "replace")
+                    user, _, pw = decoded.partition(":")
+                    u, ok = self.manager.users.verify(user, pw)
+                    if ok:
+                        return user
+                except Exception:
+                    pass
+            return None
+        else:
+            if self._authenticated():
+                return "opencode"
+            return None
+
     def _authenticated(self):
         if not self.manager.configured:
             return True
+        # Multi-user mode: check session store or per-user Basic auth
+        if self.manager.multi_user:
+            # 1. Session cookie (server-side store)
+            entry = self.manager.sessions.lookup(self._cookies().get(SESSION_COOKIE))
+            if entry:
+                return True
+            # 2. Per-user Basic auth
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Basic "):
+                try:
+                    decoded = base64.b64decode(auth[6:].strip()).decode("utf-8", "replace")
+                    user, _, pw = decoded.partition(":")
+                    u, ok = self.manager.users.verify(user, pw)
+                    if ok:
+                        return True
+                except Exception:
+                    pass
+            # 3. auth_token query param (single-password fallback only)
+            return False
+        # Single-password mode (existing behavior)
         # 1. Session cookie (browser flow)
         if verify_session_cookie(self.manager.session_secret(), self._cookies().get(SESSION_COOKIE)):
             return True
@@ -2308,8 +2681,33 @@ class Handler(BaseHTTPRequestHandler):
         nxt = f.get("next", "/manage") or "/manage"
         ip = _client_ip(self)
         self.manager.metrics.record_login_attempt()
+
+        # Multi-user mode: verify username + password against users.json
+        if self.manager.multi_user:
+            username = f.get("username", "")
+            if not username or not pw:
+                _record_login_failure(ip)
+                self.manager.metrics.record_login_failure()
+                self.manager.audit.record("unknown", ip, "login_failure", {"username": username})
+                return self._render_login(error="Invalid username or password.", next_path=nxt)
+            user, ok = self.manager.users.verify(username, pw)
+            if ok:
+                _record_login_success(ip)
+                sid = self.manager.sessions.create(username, ip, self.headers.get("User-Agent", ""))
+                self.manager.audit.record(username, ip, "login_success")
+                self.manager.log_event("info", f"login success: {username} from {ip}")
+                self._send_session_redirect(sid, nxt)
+                return
+            _record_login_failure(ip)
+            self.manager.metrics.record_login_failure()
+            self.manager.audit.record(username or "unknown", ip, "login_failure", {"username": username})
+            self.manager.log_event("warn", f"login failure: {username} from {ip}")
+            return self._render_login(error="Invalid username or password.", next_path=nxt)
+
+        # Single-password mode (existing behavior)
         if pw and hmac.compare_digest(pw, self.manager.password):
             _record_login_success(ip)
+            self.manager.audit.record("opencode", ip, "login_success")
             self.manager.log_event("info", f"login success from {ip}")
             val = make_session_cookie(self.manager.session_secret())
             self.send_response(302)
@@ -2327,8 +2725,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         _record_login_failure(ip)
         self.manager.metrics.record_login_failure()
+        self.manager.audit.record("unknown", ip, "login_failure")
         self.manager.log_event("warn", f"login failure from {ip}")
         return self._render_login(error="Incorrect password.", next_path=nxt)
+
+    def _send_session_redirect(self, sid, location):
+        """Send a 302 redirect with a session cookie for multi-user mode."""
+        self.send_response(302)
+        self.send_header("Location", location)
+        attrs = f"Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}"
+        proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        if proto == "https":
+            attrs += "; Secure"
+        self.send_header("Set-Cookie", f"{SESSION_COOKIE}={sid}; {attrs}")
+        self.send_header("Content-Length", "0")
+        for k, v in _security_headers(self).items():
+            self.send_header(k, v)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
 
     def _render_login(self, error="", next_path=None):
         err = f'<div class="alert err">{html.escape(error)}</div>' if error else ""
@@ -2337,6 +2752,15 @@ class Handler(BaseHTTPRequestHandler):
         else:
             nxt = _safe_next(next_path)
         csrf_input, csrf_cookie = self._csrf_hidden_input()
+        # Multi-user mode shows a username field; single-password mode doesn't
+        if self.manager.multi_user:
+            user_field = '<label>Username</label>\n<input name="username" autofocus required>\n'
+            pw_autofocus = ""  # username has autofocus
+            hint = '<p class="sub">Use your team account credentials.</p>'
+        else:
+            user_field = ""
+            pw_autofocus = "autofocus"
+            hint = '<p class="sub">User is <code>opencode</code>. Use the password set during first-run setup.</p>'
         page = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>{CSS}</style></head><body><div class="wrap">
 <div class="brand"><div class="brand-mark"></div><div class="brand-name">opencode</div></div>
@@ -2345,11 +2769,12 @@ class Handler(BaseHTTPRequestHandler):
 <form method="POST" action="/manage/login" class="section">
 {csrf_input}
 <input type="hidden" name="next" value="{html.escape(nxt)}">
+{user_field}
 <label>Password</label>
-<input type="password" name="password" autofocus required>
+<input type="password" name="password" {pw_autofocus} required>
 <button type="submit" class="btn-submit">Log in</button>
 </form>
-<p class="sub">User is <code>opencode</code>. Use the password set during first-run setup.</p>
+{hint}
 </div></body></html>"""
         cookies = [csrf_cookie] if csrf_cookie else None
         self._send(200, page, set_cookies=cookies)
@@ -2493,6 +2918,23 @@ class Handler(BaseHTTPRequestHandler):
             )
         if path == "/manage/metrics":
             return self._metrics()
+        # Wave 4: team features endpoints
+        if path == "/manage/sessions":
+            return self._json(200, {"sessions": self.manager.sessions.list_active()})
+        if path == "/manage/audit":
+            q = parse_qs(urlparse(self.path).query)
+            page = int(q.get("page", ["1"])[0])
+            limit = int(q.get("limit", ["50"])[0])
+            user_f = q.get("user", [None])[0]
+            action_f = q.get("action", [None])[0]
+            entries, total = self.manager.audit.read(page, limit, user_f, action_f)
+            return self._json(200, {"entries": entries, "total": total, "page": page, "limit": limit})
+        if path == "/manage/users":
+            if not self.manager.multi_user:
+                return self._json(200, {"users": [], "multi_user": False})
+            return self._json(
+                200, {"users": [{"username": u["username"], "role": u["role"]} for u in self.manager.users.load()], "multi_user": True}
+            )
         return self._send(404, "not found", "text/plain")
 
     # ── log filtering + SSE tail (Wave 2.2) ────────────────────────────────────
@@ -2642,8 +3084,11 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, "\n".join(lines) + "\n", "text/plain; version=0.0.4")
 
     def _manage_post(self, path, f, f_multi, raw):
+        user = self._current_user() or "unknown"
+        ip = _client_ip(self)
         if path == "/manage/restart":
-            self.manager.log_event("info", "restart requested via /manage")
+            self.manager.log_event("info", f"restart requested by {user} via /manage")
+            self.manager.audit.record(user, ip, "restart")
             print("[manager] restart requested via /manage", flush=True)
             threading.Thread(target=self.manager.restart_child, daemon=True).start()
             return self._redirect("/manage")
@@ -2655,6 +3100,7 @@ class Handler(BaseHTTPRequestHandler):
             provider, envvar, apikey = info
             providers = get_providers(self.data_dir)
             ok, detail = validate_provider_key(provider, apikey, providers)
+            self.manager.audit.record(user, ip, "key_revalidate", {"envvar": envvar, "ok": ok})
             return self._json(200, {"ok": ok, "detail": detail, "envvar": envvar})
         if path == "/manage/keys/rotate":
             envvar = (f.get("envvar") or "").strip().upper()
@@ -2664,8 +3110,42 @@ class Handler(BaseHTTPRequestHandler):
             self.manager.settings.update({envvar: apikey})
             reload_env_from_setup(self.data_dir)
             self.manager.log_event("info", f"key rotated for {envvar}; applying + restarting child")
+            self.manager.audit.record(user, ip, "key_rotate", {"envvar": envvar})
             print(f"[manager] key rotated for {envvar}; applying + restarting child", flush=True)
             threading.Thread(target=self.manager.apply_settings, daemon=True).start()
+            return self._redirect("/manage")
+        # Wave 4: team features POST endpoints
+        if path == "/manage/sessions/revoke":
+            sid = (f.get("sid") or "").strip()
+            if sid:
+                self.manager.sessions.revoke(sid)
+                self.manager.audit.record(user, ip, "session_revoke", {"sid": sid[:8]})
+            return self._redirect("/manage")
+        if path == "/manage/sessions/revoke-all":
+            my_sid = self._cookies().get(SESSION_COOKIE)
+            self.manager.sessions.revoke_all_except(my_sid)
+            self.manager.audit.record(user, ip, "session_revoke_all")
+            return self._redirect("/manage")
+        if path == "/manage/users/add":
+            if not self.manager.multi_user:
+                return self._json(400, {"ok": False, "error": "Multi-user mode is not enabled."})
+            username = (f.get("username") or "").strip()
+            password = (f.get("password") or "").strip()
+            role = (f.get("role") or "user").strip()
+            if role not in ("admin", "user"):
+                role = "user"
+            if not username or not password:
+                return self._json(400, {"ok": False, "error": "Username and password are required."})
+            if self.manager.users.add(username, password, role):
+                self.manager.audit.record(user, ip, "user_add", {"username": username, "role": role})
+                return self._redirect("/manage")
+            return self._json(400, {"ok": False, "error": "Username already exists."})
+        if path == "/manage/users/remove":
+            if not self.manager.multi_user:
+                return self._json(400, {"ok": False, "error": "Multi-user mode is not enabled."})
+            username = (f.get("username") or "").strip()
+            if self.manager.users.remove(username):
+                self.manager.audit.record(user, ip, "user_remove", {"username": username})
             return self._redirect("/manage")
         return self._json(404, {"ok": False, "error": "unknown management action"})
 
