@@ -1266,3 +1266,136 @@ def test_proxy_503_has_retry_after(configured_manager):
     if st == 503:
         assert "Retry-After" in hdr
         assert hdr["Retry-After"] == "10"
+
+
+# ─── Wave 4: Team features ─────────────────────────────────────────────────────
+
+
+def test_password_hash_and_verify():
+    """PBKDF2 password hashing should work for valid and invalid passwords."""
+    h = wizard._hash_password("mypassword")
+    assert h.startswith("pbkdf2$")
+    assert wizard._verify_password("mypassword", h) is True
+    assert wizard._verify_password("wrongpassword", h) is False
+    assert wizard._verify_password("", h) is False
+
+
+def test_user_store_crud(tmp_path):
+    """UserStore should support add, find, verify, remove."""
+    store = wizard.UserStore(str(tmp_path))
+    assert not store.exists()  # no users.json = single-password mode
+    assert store.load() == []
+    # Add a user
+    assert store.add("alice", "pw1", "admin") is True
+    assert store.add("alice", "pw2", "user") is False  # duplicate
+    assert store.exists()
+    # Verify
+    u, ok = store.verify("alice", "pw1")
+    assert ok is True
+    assert u["username"] == "alice"
+    assert u["role"] == "admin"
+    u, ok = store.verify("alice", "wrongpw")
+    assert ok is False
+    u, ok = store.verify("bob", "pw1")
+    assert ok is False
+    # Remove
+    assert store.remove("alice") is True
+    assert store.remove("alice") is False
+
+
+def test_session_store_create_lookup_revoke(tmp_path):
+    """SessionStore should create, lookup, and revoke sessions."""
+    store = wizard.SessionStore(str(tmp_path))
+    sid = store.create("alice", "127.0.0.1", "TestAgent/1.0")
+    assert sid
+    # Lookup should find it
+    entry = store.lookup(sid)
+    assert entry is not None
+    assert entry["username"] == "alice"
+    assert entry["ip"] == "127.0.0.1"
+    # Revoke
+    store.revoke(sid)
+    assert store.lookup(sid) is None  # revoked
+    # List active should be empty
+    assert store.list_active() == []
+
+
+def test_audit_log_record_and_read(tmp_path):
+    """AuditLog should record and read entries with filtering."""
+    log = wizard.AuditLog(str(tmp_path))
+    log.record("alice", "1.2.3.4", "login_success")
+    log.record("bob", "5.6.7.8", "login_failure", {"reason": "bad password"})
+    log.record("alice", "1.2.3.4", "restart")
+    # Read all
+    entries, total = log.read()
+    assert total == 3
+    assert entries[0]["action"] == "restart"  # newest first
+    # Filter by user
+    entries, total = log.read(user_filter="alice")
+    assert total == 2
+    assert all(e["user"] == "alice" for e in entries)
+    # Filter by action
+    entries, total = log.read(action_filter="login_failure")
+    assert total == 1
+    assert entries[0]["user"] == "bob"
+
+
+def test_multi_user_mode_login(configured_manager):
+    """In single-password mode (no users.json), login should work as before."""
+    # This test verifies that single-password mode is preserved
+    # when users.json doesn't exist (backward compatibility)
+    cookie = _login(configured_manager, "testpw")
+    assert cookie.startswith("oc_session=")
+    st, body = _req("GET", configured_manager, "/manage", headers={"Cookie": cookie})
+    assert st == 200
+    assert "dashboard" in body
+
+
+def test_bootstrap_token_not_set_allows_first_run(tmp_path, fake_bin):
+    """Without BOOTSTRAP_TOKEN set, first-run should be open as before."""
+    port = _free_port()
+    data = tmp_path / "data"
+    data.mkdir()
+    proc = _start_manager(port, str(data), fake_bin)
+    try:
+        assert _wait_ready(port)
+        st, body = _req("GET", port, "/")
+        assert st == 200
+        # No bootstrap token field should be present
+        assert "bootstrap_token" not in body.lower()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_manage_sessions_endpoint(configured_manager):
+    """/manage/sessions should return active sessions list."""
+    cookie = _login(configured_manager, "testpw")
+    st, body = _req("GET", configured_manager, "/manage/sessions", headers={"Cookie": cookie})
+    assert st == 200
+    j = json.loads(body)
+    assert "sessions" in j
+
+
+def test_manage_audit_endpoint(configured_manager):
+    """/manage/audit should return audit entries."""
+    cookie = _login(configured_manager, "testpw")
+    # Generate an audit event (login already did)
+    st, body = _req("GET", configured_manager, "/manage/audit", headers={"Cookie": cookie})
+    assert st == 200
+    j = json.loads(body)
+    assert "entries" in j
+    assert "total" in j
+
+
+def test_manage_users_endpoint_single_password(configured_manager):
+    """/manage/users should show multi_user=False in single-password mode."""
+    cookie = _login(configured_manager, "testpw")
+    st, body = _req("GET", configured_manager, "/manage/users", headers={"Cookie": cookie})
+    assert st == 200
+    j = json.loads(body)
+    assert j["multi_user"] is False
+    assert j["users"] == []
