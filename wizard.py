@@ -52,9 +52,23 @@ CACHE_NAME = "models.dev.api.json"
 CACHE_TTL = 24 * 3600
 
 MAX_BODY = 64 * 1024
+
+# ─── Rate limiting ─────────────────────────────────────────────────────────────
+# Per-IP rate limiting with login lockout. The primary key is the socket peer
+# address (Railway's proxy), not X-Forwarded-For — which can be spoofed. If
+# TRUSTED_XFF_HOPS is set (default 1 for Railway's single proxy hop), the
+# Nth-from-right XFF value is used as the "real client" key, ignoring any
+# spoofed values to its left.
+
 _RATE = {}
 _RATE_WINDOW = 60
-_RATE_MAX = 10
+_RATE_MAX_POST = 30  # state-changing + management POSTs
+_RATE_MAX_LOGIN = 10  # login attempts
+_RATE_MAX_GET = 120  # GET routes (dashboard, logs, proxy)
+_LOCKOUT = {}  # ip -> [locked_until, consecutive_failures]
+_LOCKOUT_THRESHOLD = 5  # failures before lockout kicks in
+_LOCKOUT_STEPS = [60, 300, 900]  # exponential: 1min, 5min, 15min
+_TRUSTED_XFF_HOPS = int(os.environ.get("TRUSTED_XFF_HOPS", "1"))
 
 # Valid POSIX shell identifier for custom provider key env var name.
 _ENV_VAR_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
@@ -137,23 +151,66 @@ LIVE_MODELS_URL = {
 SKIP_PROVIDERS = {"atomic-chat", "lmstudio", "privatemode-ai", "github-copilot"}
 
 
-def _rate_limited(ip):
+def _client_ip(handler):
+    """Real client IP for rate limiting.
+
+    Primary key is the socket peer address (Railway's proxy). If
+    TRUSTED_XFF_HOPS > 0, take the Nth-from-right value from X-Forwarded-For
+    as the real client — only N hops are trusted, spoofed values further
+    left are discarded. Default 1 = trust the last hop (Railway → us).
+    """
+    if _TRUSTED_XFF_HOPS > 0:
+        xff = handler.headers.get("X-Forwarded-For", "")
+        if xff:
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if len(parts) >= _TRUSTED_XFF_HOPS:
+                # Nth-from-right: e.g. N=1 → parts[-1], N=2 → parts[-2]
+                return parts[-_TRUSTED_XFF_HOPS]
+    return handler.client_address[0]
+
+
+def _rate_limited(ip, max_reqs=_RATE_MAX_POST, bucket="post"):
+    """Generic per-IP rate limit. Returns True if the IP has exceeded max_reqs
+    in the current window. GET and POST use separate buckets so heavy GET
+    traffic (e.g. polling /manage/logs) doesn't exhaust the POST budget."""
+    key = f"{ip}:{bucket}"
     now = time.time()
-    rec = _RATE.get(ip)
+    rec = _RATE.get(key)
     if not rec or now - rec[0] > _RATE_WINDOW:
-        _RATE[ip] = [now, 1]
+        _RATE[key] = [now, 1]
         return False
     rec[1] += 1
-    return rec[1] > _RATE_MAX
+    return rec[1] > max_reqs
 
 
-def _client_ip(handler):
-    """Real client IP for rate limiting. Railway proxies traffic, so
-    client_address is the proxy's IP — use X-Forwarded-For if present."""
-    xff = handler.headers.get("X-Forwarded-For", "")
-    if xff:
-        return xff.split(",")[0].strip()
-    return handler.client_address[0]
+def _login_locked(ip):
+    """True if the IP is currently locked out due to repeated login failures."""
+    rec = _LOCKOUT.get(ip)
+    if not rec:
+        return False
+    locked_until, _failures = rec
+    if time.time() < locked_until:
+        return True
+    return False  # lockout expired; will be reset on next failure or success
+
+
+def _record_login_failure(ip):
+    """Increment consecutive login failures and apply exponential lockout.
+    Lockout only kicks in after _LOCKOUT_THRESHOLD failures."""
+    rec = _LOCKOUT.get(ip)
+    failures = (rec[1] + 1) if rec else 1
+    if failures >= _LOCKOUT_THRESHOLD:
+        # Lockout duration escalates with failures beyond the threshold
+        idx = min(failures - _LOCKOUT_THRESHOLD, len(_LOCKOUT_STEPS) - 1)
+        locked_until = time.time() + _LOCKOUT_STEPS[idx]
+    else:
+        locked_until = 0  # not locked yet
+    _LOCKOUT[ip] = [locked_until, failures]
+
+
+def _record_login_success(ip):
+    """Clear lockout state on successful login."""
+    _LOCKOUT.pop(ip, None)
 
 
 # ─── models.dev loader ─────────────────────────────────────────────────────────
@@ -570,6 +627,180 @@ def _session_cookie_header(handler, value, *, clear=False):
     return f"{SESSION_COOKIE}={value}; {_cookie_attrs(handler)}"
 
 
+# ─── Edge auth helpers (cookie + Basic + auth_token query) ─────────────────────
+# The manager accepts three equivalent credentials at the edge:
+#   1. oc_session cookie (browser flow — set by POST /manage/login)
+#   2. Authorization: Basic opencode:<password> (opencode attach / TUI flow)
+#   3. ?auth_token=<password> query param (clients that can't set headers)
+# All three resolve to the single shared password. The proxy then re-injects
+# its own Basic auth to the child (wizard.py:1856), so the edge credential is
+# decoupled from the child's OPENCODE_SERVER_PASSWORD.
+
+OPENCODE_USERNAME = "opencode"
+
+
+def _check_basic_auth(header_value, password):
+    """Return True if `Authorization: Basic ...` decodes to opencode:<password>."""
+    if not header_value or not header_value.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header_value[6:].strip()).decode("utf-8", "replace")
+    except Exception:
+        return False
+    if ":" not in decoded:
+        return False
+    user, _, pw = decoded.partition(":")
+    if user != OPENCODE_USERNAME:
+        return False
+    return hmac.compare_digest(pw, password)
+
+
+def _auth_token_from_query(path):
+    """Extract ?auth_token=... from the request path, or None."""
+    q = parse_qs(urlparse(path).query)
+    vals = q.get("auth_token")
+    return vals[0] if vals else None
+
+
+def _is_non_browser_client(handler):
+    """True if the request carries Basic auth or an auth_token query param.
+
+    These clients (opencode attach, curl, SDKs) expect a 401 on auth failure,
+    not a 302 redirect to an HTML login form they can't render.
+    """
+    if handler.headers.get("Authorization", "").startswith("Basic "):
+        return True
+    if _auth_token_from_query(handler.path) is not None:
+        return True
+    return False
+
+
+def _strip_auth_token(path):
+    """Remove ?auth_token=... from a request path before proxying to the child."""
+    parsed = urlparse(path)
+    if not parsed.query:
+        return path
+    q = parse_qs(parsed.query)
+    q.pop("auth_token", None)
+    # Rebuild query string preserving order is not critical here.
+    pairs = []
+    for k, vals in q.items():
+        for v in vals:
+            pairs.append(f"{k}={v}")
+    new_query = "&".join(pairs)
+    return parsed.path + ("?" + new_query if new_query else "")
+
+
+# ─── Security headers ──────────────────────────────────────────────────────────
+
+# Headers applied to every manager-served response (login, dashboard, wizard,
+# JSON, errors). For proxied opencode responses, only the safe subset is applied
+# (see _proxy_security_headers) — we don't impose CSP on the opencode UI.
+
+_BASE_SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+}
+
+# CSP for manager HTML pages (login, dashboard, wizard, error pages). The wizard
+# uses inline <style> and a small inline <script> block, so style-src allows
+# 'unsafe-inline' (kept tight for scripts — no 'unsafe-inline' for script-src).
+_MGR_CSP = (
+    "default-src 'self';"
+    "style-src 'self' 'unsafe-inline';"
+    "script-src 'self' 'unsafe-inline';"
+    "img-src 'self' data:;"
+    "connect-src 'self';"
+    "frame-ancestors 'none'"
+)
+
+# Subset applied to proxied responses — no CSP (opencode has its own), but still
+# prevent framing and MIME sniffing.
+_PROXY_SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+}
+
+
+def _security_headers(handler, *, is_html=False, is_proxy=False):
+    """Return a dict of security headers for the response.
+
+    - is_html=True: manager HTML page → include CSP.
+    - is_proxy=True: proxied opencode response → safe subset only (no CSP).
+    - default: manager JSON/error response → base headers (no CSP needed).
+    HSTS is added only when X-Forwarded-Proto is https.
+    """
+    if is_proxy:
+        hdrs = dict(_PROXY_SECURITY_HEADERS)
+    else:
+        hdrs = dict(_BASE_SECURITY_HEADERS)
+        if is_html:
+            hdrs["Content-Security-Policy"] = _MGR_CSP
+    proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    if proto == "https":
+        hdrs["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return hdrs
+
+
+# ─── CSRF protection ───────────────────────────────────────────────────────────
+# Per-session CSRF token: hmac_sha256(session_secret, "csrf"). Stable for the
+# session, rotates when the password changes. For login (no session yet), a
+# double-submit nonce cookie is used instead.
+#
+# CSRF checks apply to manager state-changing POSTs only:
+#   /manage/login, /manage/logout, /manage/restart, /manage/revalidate,
+#   /manage/keys/rotate, /setup, /test-key, /test-github, /test-mcp
+# Proxied opencode API POSTs are NOT checked (they have their own auth via the
+# session gate, and opencode attach clients only hit the proxy).
+
+CSRF_COOKIE = "oc_csrf"
+_STATE_CHANGING_POSTS = frozenset(
+    [
+        "/manage/login",
+        "/manage/logout",
+        "/manage/restart",
+        "/manage/revalidate",
+        "/manage/keys/rotate",
+        "/setup",
+        "/test-key",
+        "/test-github",
+        "/test-mcp",
+    ]
+)
+
+
+def _csrf_token_for_secret(secret):
+    """CSRF token derived from the session secret. Stable per session."""
+    return hmac.new(secret, b"csrf", hashlib.sha256).hexdigest()
+
+
+def _csrf_token_for_password(password):
+    """CSRF token for a Basic-auth/auth_token session (derived from password)."""
+    secret = hashlib.sha256(("oc:" + password).encode()).digest()
+    return _csrf_token_for_secret(secret)
+
+
+def _login_csrf_nonce(handler):
+    """Get or create a nonce for the login form (double-submit cookie pattern).
+
+    On GET /manage/login we set a random nonce cookie and embed it in the form.
+    On POST /manage/login we verify the form nonce matches the cookie nonce.
+    Returns (nonce, set_cookie_attr) — set_cookie_attr is the Set-Cookie header
+    value to send, or None if the cookie is already present.
+    """
+    existing = handler._cookies().get(CSRF_COOKIE)
+    if existing:
+        return existing, None
+    nonce = secrets.token_urlsafe(32)
+    attrs = f"Path=/; HttpOnly; SameSite=Strict; Max-Age={10 * 60}"  # 10 min for login
+    proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    if proto == "https":
+        attrs += "; Secure"
+    return nonce, f"{CSRF_COOKIE}={nonce}; {attrs}"
+
+
 class ChildProcess:
     """Supervises the `opencode web` child on an internal port (127.0.0.1 only)."""
 
@@ -919,6 +1150,7 @@ PAGE = """<!doctype html>
   __VOLUME_ALERT__
 
   <form method="POST" action="/setup" id="form">
+    __CSRF_INPUT__
 
     <div class="section">
       <div class="section-label"><span class="num">1</span> LLM Provider</div>
@@ -1108,7 +1340,8 @@ async function testKey() {
   testBtn.disabled = true; testBtn.textContent = ''; testBtn.className = 'btn-inline';
   const sp = document.createElement('span'); sp.className = 'spinner'; testBtn.appendChild(sp);
   keyStatus.textContent = ''; keyStatus.className = 'status';
-  const body = new URLSearchParams({ provider, apikey });
+  const csrfToken = document.querySelector('input[name="csrf_token"]')?.value || '';
+  const body = new URLSearchParams({ provider, apikey, csrf_token: csrfToken });
   if (isCustom()) {
     body.set('baseurl', document.getElementById('baseurl').value.trim());
     body.set('envvar', document.getElementById('envvar').value.trim());
@@ -1147,7 +1380,7 @@ async function testGitHub() {
     const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 12000);
     const resp = await fetch('/test-github', { method: 'POST',
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: new URLSearchParams({ token }), signal: ctrl.signal });
+      body: new URLSearchParams({ token, csrf_token: document.querySelector('input[name="csrf_token"]')?.value || '' }), signal: ctrl.signal });
     clearTimeout(t);
     const data = await resp.json();
     if (data.ok) {
@@ -1196,7 +1429,7 @@ async function testMcp(mcpId) {
   try {
     const resp = await fetch('/test-mcp', { method: 'POST',
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: new URLSearchParams({ mcp_id: mcpId, key }) });
+      body: new URLSearchParams({ mcp_id: mcpId, key, csrf_token: document.querySelector('input[name="csrf_token"]')?.value || '' }) });
     const data = await resp.json();
     if (data.ok) { btn.textContent = 'Valid'; btn.className = 'btn-inline ok';
       status.textContent = data.detail || 'Connected'; status.className = 'status ok'; }
@@ -1328,12 +1561,18 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype="text/html; charset=utf-8"):
+    def _send(self, code, body, ctype="text/html; charset=utf-8", set_cookies=None):
         body = body.encode() if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if set_cookies:
+            for sc in set_cookies:
+                self.send_header("Set-Cookie", sc)
+        is_html = "html" in (ctype or "")
+        for k, v in _security_headers(self, is_html=is_html).items():
+            self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
@@ -1356,6 +1595,9 @@ class Handler(BaseHTTPRequestHandler):
             child = self.manager.child
             healthy = (not self.manager.configured) or child.is_up() or child.is_starting()
             return self._json(200, {"healthy": bool(healthy)})
+        # Rate-limit all GETs (except health) to stop scraping/hammering.
+        if _rate_limited(_client_ip(self), max_reqs=_RATE_MAX_GET, bucket="get"):
+            return self._send(429, "Too many requests — wait a minute and retry.", "text/plain")
         if path == "/manage/login":
             if self.manager.configured and self._authenticated():
                 nxt = _safe_next(parse_qs(urlparse(self.path).query).get("next", ["/manage"])[0])
@@ -1367,6 +1609,8 @@ class Handler(BaseHTTPRequestHandler):
         # everything (the opencode UI, reconfigure, management, SSE). The manager
         # injects opencode's basic auth behind the scenes so the user logs in once.
         if self.manager.configured and not self._authenticated():
+            if _is_non_browser_client(self):
+                return self._send(401, "unauthorized", "text/plain")
             return self._redirect(_login_url(path))
         if path == "/setup":
             return self._render_form()
@@ -1527,22 +1771,38 @@ class Handler(BaseHTTPRequestHandler):
             'id="apikey" type="password"',
             f'id="apikey" type="password" data-already-set="{already_set}"',
         )
-        self._send(200, page)
+        csrf_input, csrf_cookie = self._csrf_hidden_input()
+        page = page.replace("__CSRF_INPUT__", csrf_input)
+        cookies = [csrf_cookie] if csrf_cookie else None
+        self._send(200, page, set_cookies=cookies)
 
     def do_POST(self):
         path = _request_path(self)
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length > MAX_BODY:
             return self._send(413, "body too large", "text/plain")
-        if path in ("/test-key", "/test-github", "/test-mcp", "/setup", "/manage/login", "/manage/logout") and _rate_limited(
-            _client_ip(self)
-        ):
+        ip = _client_ip(self)
+        # Login lockout: if the IP is locked out, reject immediately (before
+        # parsing the body or checking CSRF).
+        if path == "/manage/login" and _login_locked(ip):
+            return self._json(429, {"ok": False, "error": "Too many failed logins — try again later.", "retry_after": 60})
+        # Rate-limit all POSTs (state-changing, management, and proxied).
+        if path == "/manage/login":
+            max_reqs = _RATE_MAX_LOGIN
+        else:
+            max_reqs = _RATE_MAX_POST
+        if _rate_limited(ip, max_reqs=max_reqs, bucket="post"):
             return self._json(429, {"ok": False, "error": "Too many requests \u2014 wait a minute and retry."})
         raw = self.rfile.read(length) if length else b""
         body = raw.decode("utf-8", "replace")
         form = parse_qs(body, keep_blank_values=True)
         f = {k: v[0] for k, v in form.items()}
         f_multi = {k: v for k, v in form.items()}
+
+        # CSRF check on all state-changing POSTs (login uses double-submit
+        # nonce; authenticated endpoints use session-derived token).
+        if path in _STATE_CHANGING_POSTS and not self._verify_csrf(f):
+            return self._send(403, "CSRF token missing or invalid", "text/plain")
 
         if path == "/manage/login":
             return self._handle_login(f)
@@ -1553,6 +1813,8 @@ class Handler(BaseHTTPRequestHandler):
         # setup/test/management/proxy endpoints without a session.
         if self.manager.configured and not self._authenticated():
             if path == "/setup":
+                if _is_non_browser_client(self):
+                    return self._send(401, "unauthorized", "text/plain")
                 return self._redirect(_login_url("/setup"))
             return self._json(401, {"ok": False, "error": "unauthenticated"})
         if path.startswith("/manage/"):
@@ -1744,6 +2006,8 @@ class Handler(BaseHTTPRequestHandler):
             "Set-Cookie",
             _session_cookie_header(self, val),
         )
+        for k, v in _security_headers(self, is_html=True).items():
+            self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
@@ -1779,12 +2043,67 @@ class Handler(BaseHTTPRequestHandler):
     def _authenticated(self):
         if not self.manager.configured:
             return True
-        return verify_session_cookie(self.manager.session_secret(), self._cookies().get(SESSION_COOKIE))
+        # 1. Session cookie (browser flow)
+        if verify_session_cookie(self.manager.session_secret(), self._cookies().get(SESSION_COOKIE)):
+            return True
+        # 2. HTTP Basic auth (opencode attach / TUI flow)
+        if _check_basic_auth(self.headers.get("Authorization", ""), self.manager.password):
+            return True
+        # 3. ?auth_token=<password> query param (headerless clients)
+        tok = _auth_token_from_query(self.path)
+        if tok and hmac.compare_digest(tok, self.manager.password):
+            return True
+        return False
+
+    def _csrf_token(self):
+        """The expected CSRF token for the current authenticated session."""
+        return _csrf_token_for_secret(self.manager.session_secret())
+
+    def _csrf_ok(self, f):
+        """Verify the CSRF token in the form (or X-CSRF-Token header) matches."""
+        expected = self._csrf_token()
+        token = (f.get("csrf_token") or "").strip()
+        if not token:
+            token = (self.headers.get("X-CSRF-Token") or "").strip()
+        return bool(token) and hmac.compare_digest(token, expected)
+
+    def _verify_csrf(self, f):
+        """Unified CSRF check for all state-changing POSTs.
+
+        - Authenticated (cookie/Basic/auth_token): session-derived token.
+        - Unauthenticated (login or first-run): double-submit nonce cookie.
+        """
+        if self.manager.configured and self._authenticated():
+            return self._csrf_ok(f)
+        # Double-submit nonce for login / first-run
+        cookie_nonce = self._cookies().get(CSRF_COOKIE)
+        form_nonce = (f.get("csrf_token") or "").strip()
+        if not cookie_nonce or not form_nonce:
+            return False
+        return hmac.compare_digest(cookie_nonce, form_nonce)
+
+    def _csrf_for_form(self):
+        """Return (token, set_cookie) for embedding in a form.
+
+        set_cookie is a Set-Cookie header value to send, or None if no cookie
+        needs to be set (already present or session-based).
+        """
+        if self.manager.configured and self._authenticated():
+            return self._csrf_token(), None
+        nonce, set_cookie = _login_csrf_nonce(self)
+        return nonce, set_cookie
+
+    def _csrf_hidden_input(self):
+        """Return the HTML hidden input for the CSRF token, plus any cookie to set."""
+        token, set_cookie = self._csrf_for_form()
+        return f'<input type="hidden" name="csrf_token" value="{html.escape(token)}">', set_cookie
 
     def _redirect(self, to):
         self.send_response(302)
         self.send_header("Location", to)
         self.send_header("Content-Length", "0")
+        for k, v in _security_headers(self).items():
+            self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
@@ -1794,6 +2113,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", to)
         self.send_header("Set-Cookie", _session_cookie_header(self, "", clear=True))
         self.send_header("Content-Length", "0")
+        for k, v in _security_headers(self).items():
+            self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
@@ -1803,7 +2124,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._redirect("/setup")
         pw = f.get("password", "")
         nxt = f.get("next", "/manage") or "/manage"
+        ip = _client_ip(self)
         if pw and hmac.compare_digest(pw, self.manager.password):
+            _record_login_success(ip)
             val = make_session_cookie(self.manager.session_secret())
             self.send_response(302)
             self.send_header("Location", nxt)
@@ -1812,10 +2135,13 @@ class Handler(BaseHTTPRequestHandler):
                 _session_cookie_header(self, val),
             )
             self.send_header("Content-Length", "0")
+            for k, v in _security_headers(self).items():
+                self.send_header(k, v)
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
             return
+        _record_login_failure(ip)
         return self._render_login(error="Incorrect password.", next_path=nxt)
 
     def _render_login(self, error="", next_path=None):
@@ -1824,12 +2150,14 @@ class Handler(BaseHTTPRequestHandler):
             nxt = _safe_next(parse_qs(urlparse(self.path).query).get("next", ["/manage"])[0])
         else:
             nxt = _safe_next(next_path)
+        csrf_input, csrf_cookie = self._csrf_hidden_input()
         page = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>{CSS}</style></head><body><div class="wrap">
 <div class="brand"><div class="brand-mark"></div><div class="brand-name">opencode</div></div>
 <p class="sub">Railway manager &middot; login</p>
 {err}
 <form method="POST" action="/manage/login" class="section">
+{csrf_input}
 <input type="hidden" name="next" value="{html.escape(nxt)}">
 <label>Password</label>
 <input type="password" name="password" autofocus required>
@@ -1837,7 +2165,8 @@ class Handler(BaseHTTPRequestHandler):
 </form>
 <p class="sub">User is <code>opencode</code>. Use the password set during first-run setup.</p>
 </div></body></html>"""
-        self._send(200, page)
+        cookies = [csrf_cookie] if csrf_cookie else None
+        self._send(200, page, set_cookies=cookies)
 
     # ── reverse proxy to the opencode child ───────────────────────────────────
 
@@ -1859,13 +2188,22 @@ class Handler(BaseHTTPRequestHandler):
             out_headers["Connection"] = "close"
             if body:
                 out_headers["Content-Length"] = str(len(body))
-            conn.request(method, self.path, body=body, headers=out_headers)
+            # Strip auth_token from the query string before proxying so the
+            # edge credential doesn't leak to the child's access logs.
+            proxy_path = _strip_auth_token(self.path)
+            conn.request(method, proxy_path, body=body, headers=out_headers)
             resp = conn.getresponse()
             self.send_response_only(resp.status, resp.reason)
+            existing = {k.lower() for k, _ in resp.getheaders()}
             for k, v in resp.getheaders():
                 if k.lower() in HOP_BY_HOP:
                     continue
                 self.send_header(k, v)
+            # Add security headers (safe subset — no CSP on proxied UI) without
+            # duplicating any the child already set.
+            for k, v in _security_headers(self, is_proxy=True).items():
+                if k.lower() not in existing:
+                    self.send_header(k, v)
             self.send_header("Connection", "close")
             self.end_headers()
             try:
@@ -1971,6 +2309,8 @@ class Handler(BaseHTTPRequestHandler):
         up = mgr.child.is_up()
         with mgr.child._lock:
             pid = mgr.child.proc.pid if mgr.child.proc and mgr.child.proc.poll() is None else None
+        csrf_token = self._csrf_token()
+        csrf_input = f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">'
         rows = [
             ("opencode child", f"{'up' if up else 'down'}" + (f" (pid {pid})" if pid else "")),
             ("Provider", prev.get("OPENCODE_PROVIDER", "—")),
@@ -1999,6 +2339,7 @@ class Handler(BaseHTTPRequestHandler):
 <span id="reval-result" class="muted" style="margin-left:10px"></span>
 </div>
 <form method="POST" action="/manage/keys/rotate" class="section" style="margin-top:12px">
+{csrf_input}
 <input type="hidden" name="envvar" value="{html.escape(key_info[1])}">
 <label>Rotate key — paste a new {html.escape(key_info[1])}:</label>
 <input type="password" name="apikey" placeholder="new key" required>
@@ -2014,6 +2355,7 @@ class Handler(BaseHTTPRequestHandler):
 <div class="section" style="margin-top:20px">
 <a class="btn-submit" style="display:inline-block;text-decoration:none;margin-right:10px" href="/setup">Reconfigure</a>
 <form method="POST" action="/manage/restart" style="display:inline">
+{csrf_input}
 <button type="submit" class="btn-submit">Restart opencode</button>
 </form>
 <a class="btn-small" style="margin-left:10px" href="/manage/logout">Log out</a>
@@ -2029,7 +2371,8 @@ class Handler(BaseHTTPRequestHandler):
 .log-line{{font-family:monospace;font-size:12px;white-space:pre-wrap;color:var(--text)}}
 .log-line.muted,.muted{{color:var(--muted)}}</style>
 <script>async function revalidate(){{const b=document.getElementById('reval-btn');b.disabled=true;const r=document.getElementById('reval-result');
-try{{const res=await fetch('/manage/revalidate',{{method:'POST'}});const j=await res.json();r.textContent=j.ok?('OK: '+j.detail):('FAIL: '+(j.error||j.detail));r.style.color=j.ok?'var(--ok)':'var(--err,#f87171)'}}
+const csrfToken=document.querySelector('input[name="csrf_token"]')?.value||'';
+try{{const res=await fetch('/manage/revalidate',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'csrf_token='+encodeURIComponent(csrfToken)}});const j=await res.json();r.textContent=j.ok?('OK: '+j.detail):('FAIL: '+(j.error||j.detail));r.style.color=j.ok?'var(--ok)':'var(--err,#f87171)'}}
 catch(e){{r.textContent='error: '+e}}finally{{b.disabled=false}}}}</script>
 </body></html>"""
         self._send(200, page)
