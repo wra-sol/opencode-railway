@@ -810,6 +810,7 @@ class ChildProcess:
         self.log_ring = log_ring
         self.proc = None
         self.stopping = False
+        self.draining = False  # Wave 3.4: set during restart to signal 503+Retry-After
         self.crashes = 0
         self._lock = threading.Lock()
         # ── Runtime telemetry (Wave 2.1) ──
@@ -961,12 +962,14 @@ class ChildProcess:
 
     def restart(self, reason="manual"):
         self.crashes = 0
+        self.draining = True
         # Set the restart reason so _watch records it correctly instead of "stopped"
         self._restart_reason = reason
         self.stop()
         self.stopping = False
         with self._lock:
             self._spawn()
+        self.draining = False
         threading.Thread(target=self._watch, daemon=True).start()
 
     def is_up(self):
@@ -1326,10 +1329,7 @@ PAGE = """<!doctype html>
     <div class="section">
       <div class="section-label"><span class="num">3</span> Server</div>
 
-      <div class="field">
-        <label for="password">Password <span class="opt">(blank = auto)</span></label>
-        <input name="password" id="password" value="__PW_VAL__" placeholder="auto-generated" class="mono">
-      </div>
+      __PASSWORD_FIELD__
 
       <div class="grid2">
         <div class="field">
@@ -1867,13 +1867,30 @@ class Handler(BaseHTTPRequestHandler):
             .replace("__MODEL_VAL__", html.escape(default_model_val))
             .replace("__REPO_VAL__", html.escape(prev.get("GIT_REPO", "")))
             .replace("__BRANCH_VAL__", html.escape(prev.get("GIT_REPO_BRANCH", "")))
-            .replace("__PW_VAL__", html.escape(prev.get("OPENCODE_SERVER_PASSWORD", "")))
             .replace("__GITNAME_VAL__", html.escape(prev.get("GIT_USER_NAME", "opencode")))
             .replace("__GITEMAIL_VAL__", html.escape(prev.get("GIT_USER_EMAIL", "opencode@railway.local")))
             .replace("__MCP_ROWS__", mcp_rows_html)
             .replace("__SKILL_ROWS__", skill_rows_html)
             .replace("__MCP_CUSTOM_PREFILL__", mcp_custom_prefill_js)
         )
+        # Wave 3.2: Show the right password field based on configured state
+        if self.manager.configured:
+            pw_field = (
+                '<div class="field">'
+                '<label for="change_password">Change password <span class="opt">(blank = keep current)</span></label>'
+                '<input type="password" name="change_password" id="change_password" placeholder="leave blank to keep current" class="mono">'
+                "</div>"
+            )
+        else:
+            pw_field = (
+                '<div class="field">'
+                '<label for="password">Password <span class="opt">(blank = auto)</span></label>'
+                '<input name="password" id="password" value="'
+                + html.escape(prev.get("OPENCODE_SERVER_PASSWORD", ""))
+                + '" placeholder="auto-generated" class="mono">'
+                "</div>"
+            )
+        page = page.replace("__PASSWORD_FIELD__", pw_field)
         page = page.replace(
             'id="apikey" type="password"',
             f'id="apikey" type="password" data-already-set="{already_set}"',
@@ -2021,7 +2038,35 @@ class Handler(BaseHTTPRequestHandler):
         if not apikey and env_var_already_set(envvar):
             apikey = os.environ[envvar]
 
-        password = (f.get("password") or "").strip() or secrets.token_urlsafe(18)
+        # ── Wave 3.3: server-side test-before-apply on provider key ──
+        # Only on reconfigure (not first-run — the standalone Test button is
+        # the validation path there). If the key is non-empty and differs from
+        # the current one (or the provider changed), validate it live before
+        # writing .setup.env.
+        if self.manager.configured:
+            prev_env = load_existing(self.data_dir)
+            prev_provider = prev_env.get("OPENCODE_PROVIDER", "")
+            prev_key = os.environ.get(envvar, prev_env.get(envvar, ""))
+            key_changed = apikey and (apikey != prev_key or provider != prev_provider)
+            if key_changed:
+                ok, msg = validate_provider_key(provider, apikey, providers, custom)
+                if not ok:
+                    return self._send(400, self._err_page(f"Provider key validation failed: {msg}"))
+
+        # ── Wave 3.2: no surprise password regen ──
+        # Blank password = keep current (if configured). A separate explicit
+        # "change password" field triggers a change. First-run still auto-generates.
+        change_password = (f.get("change_password") or "").strip()
+        if self.manager.configured:
+            # Reconfigure: keep current password unless explicitly changed
+            if change_password:
+                password = change_password
+            else:
+                password = self.manager.password
+        else:
+            # First-run: use the provided password or auto-generate
+            password = (f.get("password") or "").strip() or secrets.token_urlsafe(18)
+
         # Model selection is handled by opencode's /models at runtime for known
         # providers. Custom endpoints aren't in models.dev, so opencode won't
         # know their model ids — require one here and persist it as custom/<id>.
@@ -2039,36 +2084,54 @@ class Handler(BaseHTTPRequestHandler):
         gitname = (f.get("gitname") or "opencode").strip() or "opencode"
         gitemail = (f.get("gitemail") or "").strip() or "opencode@railway.local"
 
-        env_path = os.path.join(self.data_dir, ".setup.env")
-        lines = [
-            "# Written by opencode setup wizard. Do not commit.",
-            f"OPENCODE_PROVIDER={shlex.quote(provider)}",
-            f"OPENCODE_PROVIDER_KEY_ENV={shlex.quote(envvar)}",
-            f"{envvar}={shlex.quote(apikey)}",
-            f"OPENCODE_SERVER_PASSWORD={shlex.quote(password)}",
-            f"GIT_USER_NAME={shlex.quote(gitname)}",
-            f"GIT_USER_EMAIL={shlex.quote(gitemail)}",
-        ]
-        if model:
-            lines.append(f"OPENCODE_MODEL={shlex.quote(model)}")
-        if repo:
-            lines.append(f"GIT_REPO={shlex.quote(repo)}")
-        if branch:
-            lines.append(f"GIT_REPO_BRANCH={shlex.quote(branch)}")
-        if ghtoken:
-            lines.append(f"GITHUB_TOKEN={shlex.quote(ghtoken)}")
+        # ── Wave 3.1: merge-based .setup.env writes ──
+        # Load the existing .setup.env and merge the form fields into it,
+        # preserving any env vars not managed by the form (e.g. keys rotated
+        # via /manage/keys/rotate, or custom env vars).
+        prev = load_existing(self.data_dir)
+        managed = dict(prev)  # start from existing, overwrite below
+
+        # Form-managed keys — these are the only keys the form overwrites
+        managed["OPENCODE_PROVIDER"] = provider
+        managed["OPENCODE_PROVIDER_KEY_ENV"] = envvar
+        managed[envvar] = apikey
+        managed["OPENCODE_SERVER_PASSWORD"] = password
+        managed["GIT_USER_NAME"] = gitname
+        managed["GIT_USER_EMAIL"] = gitemail
+
+        # Optional fields: set if provided, clear if empty (but only for
+        # form-managed keys — don't touch unknown keys)
+        for key, val in [("OPENCODE_MODEL", model), ("GIT_REPO", repo), ("GIT_REPO_BRANCH", branch), ("GITHUB_TOKEN", ghtoken)]:
+            if val:
+                managed[key] = val
+            elif key in managed:
+                # Clear if the form explicitly left it empty (but only if it
+                # was a form-managed key, not an out-of-band addition)
+                if key in ("OPENCODE_MODEL", "GIT_REPO", "GIT_REPO_BRANCH", "GITHUB_TOKEN"):
+                    managed.pop(key, None)
+
+        # Custom provider fields
         if is_custom:
-            lines.append(f"OPENCODE_CUSTOM_ID={shlex.quote(custom['id'])}")
-            lines.append(f"OPENCODE_CUSTOM_LABEL={shlex.quote(custom['label'])}")
-            lines.append(f"OPENCODE_CUSTOM_BASEURL={shlex.quote(custom['baseurl'])}")
-            lines.append(f"OPENCODE_CUSTOM_NPM={shlex.quote(custom['npm'])}")
-            lines.append(f"OPENCODE_CUSTOM_ENV={shlex.quote(custom['env'])}")
+            managed["OPENCODE_CUSTOM_ID"] = custom["id"]
+            managed["OPENCODE_CUSTOM_LABEL"] = custom["label"]
+            managed["OPENCODE_CUSTOM_BASEURL"] = custom["baseurl"]
+            managed["OPENCODE_CUSTOM_NPM"] = custom["npm"]
+            managed["OPENCODE_CUSTOM_ENV"] = custom["env"]
+        else:
+            # Clear custom provider fields if switching back to a known provider
+            for k in (
+                "OPENCODE_CUSTOM_ID",
+                "OPENCODE_CUSTOM_LABEL",
+                "OPENCODE_CUSTOM_BASEURL",
+                "OPENCODE_CUSTOM_NPM",
+                "OPENCODE_CUSTOM_ENV",
+            ):
+                managed.pop(k, None)
 
         # MCP servers (opt-in via checkboxes)
         enabled_mcps = f_multi.get("mcp", [])
         if enabled_mcps:
-            lines.append(f"ENABLED_MCPS={shlex.quote(','.join(enabled_mcps))}")
-            prev_mcp = load_existing(self.data_dir)
+            managed["ENABLED_MCPS"] = ",".join(enabled_mcps)
             for mid in enabled_mcps:
                 cfg_mcp = MCP_CATALOG.get(mid)
                 if not cfg_mcp or not cfg_mcp.get("needs_key"):
@@ -2076,22 +2139,28 @@ class Handler(BaseHTTPRequestHandler):
                 key_env = cfg_mcp["key_env"]
                 mcp_key = (f.get(f"mcp_key_{mid}") or "").strip()
                 if not mcp_key:
-                    mcp_key = prev_mcp.get(key_env, "")
+                    mcp_key = prev.get(key_env, "")
                 if mcp_key:
-                    lines.append(f"{key_env}={shlex.quote(mcp_key)}")
+                    managed[key_env] = mcp_key
+        else:
+            managed.pop("ENABLED_MCPS", None)
 
+        # MCP custom JSON
         mcp_custom = (f.get("mcp_custom") or "").strip()
         if mcp_custom and mcp_custom != "[]":
-            lines.append(f"MCP_CUSTOM={shlex.quote(mcp_custom)}")
+            managed["MCP_CUSTOM"] = mcp_custom
+        else:
+            managed.pop("MCP_CUSTOM", None)
 
         # Skills (opt-in via checkboxes)
         enabled_skills = f_multi.get("skill", [])
         if enabled_skills:
-            lines.append(f"ENABLED_SKILLS={shlex.quote(','.join(enabled_skills))}")
+            managed["ENABLED_SKILLS"] = ",".join(enabled_skills)
+        else:
+            managed.pop("ENABLED_SKILLS", None)
 
-        with open(env_path, "w") as fh:
-            fh.write("\n".join(lines) + "\n")
-        os.chmod(env_path, 0o600)
+        # Write the merged config using the same Settings path as /manage/keys/rotate
+        self.manager.settings.write(managed)
 
         # Reload env synchronously so os.environ (and thus the session secret for
         # the cookie below) reflects the new password immediately; apply_settings
@@ -2105,7 +2174,11 @@ class Handler(BaseHTTPRequestHandler):
         # page's redirect to / doesn't bounce through /manage/login again.
         secret = hashlib.sha256(("oc:" + password).encode()).digest()
         val = make_session_cookie(secret)
-        body = SUCCESS.replace("__CSS__", CSS).replace("__PW__", html.escape(password))
+        # Only show the password on the success page if it was (re)generated
+        # on first-run, or explicitly changed via the change_password field.
+        show_pw = not self.manager.configured or bool(change_password)
+        pw_display = html.escape(password) if show_pw else "(unchanged)"
+        body = SUCCESS.replace("__CSS__", CSS).replace("__PW__", pw_display)
         body_b = body.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2285,8 +2358,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _proxy(self, method, body=b""):
         mgr = self.manager
-        if not mgr.child.is_up():
-            return self._send(503, "opencode is starting up — retry shortly.", "text/plain")
+        if mgr.child.draining or not mgr.child.is_up():
+            msg = b"opencode is restarting - retry shortly."
+            self.send_response(503)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(msg)))
+            self.send_header("Retry-After", "10")
+            self.send_header("Cache-Control", "no-store")
+            for k, v in _security_headers(self).items():
+                self.send_header(k, v)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.wfile.write(msg)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         try:
             conn = http.client.HTTPConnection("127.0.0.1", mgr.child.internal_port, timeout=None)
             out_headers = {}
